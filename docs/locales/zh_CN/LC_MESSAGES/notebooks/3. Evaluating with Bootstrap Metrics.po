@@ -1,0 +1,182 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023, Edward West
+# This file is distributed under the same license as the PyBroker package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2023.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: PyBroker \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-08-04 18:14-0700\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: zh_CN\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: ../../source/notebooks/3. 95b673700d5f4e6098b29f8baa7f47f5 Bootstrap
+#: Evaluating Metrics.ipynb:9 with
+msgid "Evaluating with Bootstrap Metrics"
+msgstr "使用 Bootstrap 指标评估"
+
+#: ../../source/notebooks/3. 758805672f4c471abb872843fbd2b492 Bootstrap
+#: Evaluating Metrics.ipynb:11 with
+msgid ""
+"Bootstrap metrics provide a more thorough evaluation of a trading "
+"strategy by simulating a wide range of potential market outcomes. Instead"
+" of relying on a single historical path, this approach reveals how robust"
+" your edge is."
+msgstr ""
+"自助法指标通过模拟广泛的潜在市场情形，对交易策略进行更全面的评估。与依赖单一历史路径不同，这种方法能够揭示你的优势有多稳健。"
+
+#: ../../source/notebooks/3. 2b7ce825dcab403988de1b58044aee44 Bootstrap
+#: Evaluating Metrics.ipynb:13 with
+msgid ""
+"`In the previous notebook "
+"<https://www.pybroker.com/en/latest/notebooks/2.%20Backtesting%20a%20Strategy.html>`__,"
+" we implemented and backtested a trading strategy. Here is that "
+"implementation again:"
+msgstr ""
+"`在上一篇文档中 "
+"<https://www.pybroker.com/en/latest/notebooks/2.%20Backtesting%20a%20Strategy.html>`__，"
+"我们实现并回测了一个交易策略。下面再次给出该实现："
+
+#: ../../source/notebooks/3. 0b7a99074e034b86ae7e408b11f0a500 Bootstrap
+#: Evaluating Metrics.ipynb:54 with
+msgid ""
+"As before, we create a new `Strategy "
+"<https://www.pybroker.com/en/latest/reference/pybroker.strategy.html#pybroker.strategy.Strategy>`__"
+" instance with the given configurations:"
+msgstr ""
+"与之前一样，我们使用给定的配置创建一个新的 `Strategy "
+"<https://www.pybroker.com/en/latest/reference/pybroker.strategy.html#pybroker.strategy.Strategy>`__"
+" 实例："
+
+#: ../../source/notebooks/3. Bootstrap Evaluating Metrics.ipynb:78
+#: dad09f8f675d4ebfaf7b42efd8fbf91a with
+msgid "Next, we run the backtest with bootstrap metrics enabled:"
+msgstr "接下来，我们运行启用了自助法指标的回测："
+
+#: ../../source/notebooks/3. 9246aac90b9d435ea559124320210160 Bootstrap
+#: Evaluating Metrics.ipynb:544 with
+msgid ""
+"While the ``total_pnl`` metric above suggests a profitable strategy, "
+"these results could just be due to chance. To increase confidence in our "
+"evaluation, we can use the `bootstrap method "
+"<https://en.wikipedia.org/wiki/Bootstrapping_(statistics)>`__ to compute "
+"metrics."
+msgstr ""
+"尽管上面的 ``total_pnl`` 指标显示这是一个盈利的策略，但这些结果可能只是偶然所致。为了提高我们评估结果的可信度，"
+"我们可以使用 `自助法 <https://en.wikipedia.org/wiki/Bootstrapping_(statistics)>`__ "
+"来计算指标。"
+
+#: ../../source/notebooks/3. 3bccaa35d8eb493aa4199b1af0c90989 Bootstrap
+#: Evaluating Metrics.ipynb:546 with
+msgid ""
+"Bootstrapping works by drawing thousands of random samples from the "
+"backtest's returns, computing the metric for each sample, and averaging "
+"the results. This provides a more robust and accurate estimate of "
+"performance."
+msgstr ""
+"自助法的原理是从回测的收益率中抽取数千个随机样本，对每个样本计算指标，然后取其平均值，从而获得更稳健、更准确的绩效估计。"
+
+#: ../../source/notebooks/3. 786d88b4fd9940918d87e1016fd1af01 Bootstrap
+#: Evaluating Metrics.ipynb:549 with
+msgid "Confidence Intervals"
+msgstr "置信区间"
+
+#: ../../source/notebooks/3. 093488b2b2064d788ae9eb83fbc84925 Bootstrap
+#: Evaluating Metrics.ipynb:551 with
+msgid ""
+"**PyBroker** applies the bootstrap method to calculate `confidence "
+"intervals <https://en.wikipedia.org/wiki/Confidence_interval>`__ for two "
+"performance metrics: the `Profit Factor "
+"<https://www.pybroker.com/en/latest/reference/pybroker.eval.html#pybroker.eval.EvalMetrics.profit_factor>`__"
+" and the `Sharpe Ratio <https://en.wikipedia.org/wiki/Sharpe_ratio>`__."
+msgstr ""
+"**PyBroker** 使用自助法为两个绩效指标计算 `置信区间 "
+"<https://en.wikipedia.org/wiki/Confidence_interval>`__：`利润因子 "
+"<https://www.pybroker.com/en/latest/reference/pybroker.eval.html#pybroker.eval.EvalMetrics.profit_factor>`__"
+" 和 `夏普比率 <https://en.wikipedia.org/wiki/Sharpe_ratio>`__。"
+
+#: ../../source/notebooks/3. Bootstrap Evaluating Metrics.ipynb:695
+#: fb6f08ed662a424b9e0c5a461dfef335 with
+msgid ""
+"**PyBroker** uses the `bias-corrected and accelerated (BCa) bootstrap "
+"method <https://en.wikipedia.org/wiki/Bootstrapping_(statistics)#Bias-"
+"corrected_and_accelerated_(BCa)_bootstrap>`__ to calculate confidence "
+"intervals for these metrics. Returns are sampled per-bar rather than per-"
+"trade to capture more granular data."
+msgstr ""
+"**PyBroker** 使用 `偏差校正加速（BCa）自助法 "
+"<https://en.wikipedia.org/wiki/Bootstrapping_(statistics)#Bias-"
+"corrected_and_accelerated_(BCa)_bootstrap>`__ 计算这些指标的置信区间。收益率按每根 K 线"
+"而非每笔交易抽样，以捕捉更精细的数据。"
+
+#: ../../source/notebooks/3. Bootstrap Evaluating Metrics.ipynb:697
+#: bfc478a808774c15974d10c5343a534e with
+msgid ""
+"The resulting table displays the lower bound of the confidence interval "
+"at the specified confidence level, providing a more conservative estimate"
+" of the strategy's performance. For example, we can be ``97.5%`` "
+"confident that the Sharpe Ratio is at or above a given value *x*."
+msgstr ""
+"生成的表格显示了在指定置信水平下置信区间的下限，从而对策略表现给出更保守的估计。例如，我们可以有 ``97.5%`` "
+"的把握认为夏普比率达到或超过给定值 *x*。"
+
+#: ../../source/notebooks/3. Bootstrap Evaluating Metrics.ipynb:699
+#: b21e585b21e64ad696e4f89ce99839b0 with
+msgid ""
+"In this example, the Sharpe Ratio has a negative lower bound, and the "
+"Profit Factor's lower bound is less than 1, suggesting the strategy is "
+"unreliable."
+msgstr "在这个例子中，夏普比率的下界为负，利润因子的下界小于 1，这表明策略是不可靠的。"
+
+#: ../../source/notebooks/3. Bootstrap Evaluating Metrics.ipynb:702
+#: f0091a86781f40cda31dfc0da65337b1 with
+msgid "Maximum Drawdown"
+msgstr "最大回撤"
+
+#: ../../source/notebooks/3. 3ec7281e1e24482aa40d7fdd151d4644 Bootstrap
+#: Evaluating Metrics.ipynb:704 with
+msgid ""
+"Next, we evaluate the maximum drawdown of the strategy using the "
+"bootstrap method. The probabilities of the drawdown not exceeding certain"
+" thresholds (represented in both cash and percentage of portfolio equity)"
+" are displayed below:"
+msgstr ""
+"接下来，我们使用自助法评估策略的最大回撤。回撤不超过特定阈值（分别以现金和投资组合权益百分比表示）的概率如下所示："
+
+#: ../../source/notebooks/3. Bootstrap Evaluating Metrics.ipynb:828
+#: f6c4408dca5e493c99febb9c3754b8d2 with
+msgid ""
+"These confidence levels were obtained using per-bar returns from the "
+"backtest's out-of-sample results, similar to how the Profit Factor and "
+"Sharpe Ratio were calculated."
+msgstr "这些置信水平是根据回测的样本外结果中的每根 K 线收益率获得的，类似于计算利润因子和夏普比率的方法。"
+
+#: ../../source/notebooks/3. 8f7da1ae916241539c82f3df31e587d2 Bootstrap
+#: Evaluating Metrics.ipynb:830 with
+msgid ""
+"We can observe that the bootstrapped max drawdown of ``-23.1%`` at a "
+"``99.9%`` confidence level is worse than the ``-4.7%`` we saw in our "
+"original results. This highlights the importance of using randomized "
+"tests to evaluate the performance of your trading strategy."
+msgstr ""
+"我们可以观察到，在 ``99.9%`` 置信水平下，自助法得出的最大回撤为 ``-23.1%``，比我们原始结果中看到的 "
+"``-4.7%`` 更严重。这凸显了使用随机化测试来评估交易策略表现的重要性。"
+
+#: ../../source/notebooks/3. 0eba504f756444daa65a98b4eb360e60 Bootstrap
+#: Evaluating Metrics.ipynb:832 with
+#, python-format
+msgid ""
+"`In the next notebook, we will discuss how to incorporate ranking long "
+"and short signals in your trading strategies "
+"<https://www.pybroker.com/en/latest/notebooks/4.%20Ranking%20Long%20and%20Short%20Signals.html>`__."
+msgstr ""
+"`在下一篇文档中，我们将讨论如何在交易策略中结合多空信号排名 "
+"<https://www.pybroker.com/en/latest/notebooks/4.%20Ranking%20Long%20and%20Short%20Signals.html>`__。"

@@ -1,0 +1,362 @@
+"""Contains common test fixtures."""
+
+"""Copyright (C) 2023 Edward West. All rights reserved.
+
+This code is licensed under Apache 2.0 with Commons Clause license
+(see LICENSE for details).
+"""
+
+import numpy as np
+import os
+import pandas as pd
+import pytest
+from decimal import Decimal
+from pybroker.cache import (
+    clear_data_source_cache,
+    clear_indicator_cache,
+    clear_model_cache,
+    disable_data_source_cache,
+    disable_indicator_cache,
+    disable_model_cache,
+    enable_data_source_cache,
+    enable_model_cache,
+    enable_indicator_cache,
+)
+from pybroker.common import PriceType
+from pybroker.indicator import IndicatorSymbol, indicator
+from pybroker.model import ModelSymbol, TrainedModel, model
+from pybroker.scope import (
+    ColumnScope,
+    IndicatorScope,
+    ModelInputScope,
+    PendingOrder,
+    PendingOrderScope,
+    PredictionScope,
+    StaticScope,
+    IntervalScope,
+)
+from pybroker.interval import IntervalData
+from pybroker.vect import highv, lowv, sumv
+from typing import NamedTuple
+
+MODEL_NAME = "fake_model"
+
+
+class FakeModel:
+    def __init__(self, symbol, preds):
+        self.symbol = symbol
+        self._preds = preds
+
+    def predict(self, _):
+        return self._preds
+
+
+class LazyFixture(NamedTuple):
+    name: str
+
+
+def get_fixture(request, param):
+    if isinstance(param, LazyFixture):
+        return request.getfixturevalue(param.name)
+    return param
+
+
+@pytest.fixture()
+def minute_bars_df():
+    dates = pd.date_range("2020-01-06 09:30", periods=390 * 5, freq="1min")
+    n = len(dates)
+    close = np.linspace(100, 110, n)
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "symbol": ["SPY"] * n,
+            "open": close,
+            "high": close + 0.5,
+            "low": close - 0.5,
+            "close": close,
+            "volume": np.ones(n),
+        }
+    )
+
+
+@pytest.fixture()
+def data_source_df():
+    return pd.read_pickle(
+        os.path.join(os.path.dirname(__file__), "testdata/daily_1.pkl")
+    )
+
+
+@pytest.fixture()
+def symbols(data_source_df):
+    return list(data_source_df["symbol"].unique())
+
+
+@pytest.fixture()
+def symbol(symbols):
+    return symbols[0]
+
+
+@pytest.fixture()
+def dates(data_source_df):
+    return list(data_source_df["date"].unique())
+
+
+@pytest.fixture()
+def scope():
+    scope = StaticScope.instance()
+    yield scope
+    StaticScope.set_instance(None)
+
+
+@pytest.fixture()
+def hhv_ind(scope):
+    return indicator("hhv", lambda bar_data, n: highv(bar_data.close, n), n=5)
+
+
+@pytest.fixture()
+def llv_ind(scope):
+    return indicator("llv", lambda bar_data, n: lowv(bar_data.close, n), n=3)
+
+
+@pytest.fixture()
+def sumv_ind(scope):
+    return indicator("sumv", lambda bar_data, n: sumv(bar_data.close, n), n=2)
+
+
+@pytest.fixture()
+def ind_data(data_source_df, symbols, hhv_ind, llv_ind, sumv_ind):
+    return {
+        **{
+            IndicatorSymbol(ind.name, sym): ind(
+                data_source_df[data_source_df["symbol"] == sym]
+            )
+            for sym in symbols
+            for ind in [hhv_ind, llv_ind, sumv_ind]
+        }
+    }
+
+
+@pytest.fixture()
+def indicators(hhv_ind, llv_ind, sumv_ind):
+    return [hhv_ind, llv_ind, sumv_ind]
+
+
+@pytest.fixture()
+def ind_names(indicators):
+    return list(map(lambda x: x.name, indicators))
+
+
+@pytest.fixture()
+def ind_name(ind_names):
+    return ind_names[0]
+
+
+@pytest.fixture()
+def ind_df(data_source_df, hhv_ind, llv_ind, sumv_ind):
+    return pd.DataFrame(
+        {
+            hhv_ind.name: hhv_ind(data_source_df),
+            llv_ind.name: llv_ind(data_source_df),
+            sumv_ind.name: sumv_ind(data_source_df),
+        }
+    )
+
+
+@pytest.fixture(params=[True, False])
+def model_source(scope, data_source_df, indicators, request):
+    return model(
+        MODEL_NAME,
+        lambda sym, *_: FakeModel(
+            sym,
+            np.full(
+                data_source_df[data_source_df["symbol"] == sym].shape[0], 100
+            ),
+        ),
+        indicators,
+        pretrained=request.param,
+    )
+
+
+@pytest.fixture()
+def preds(symbols, data_source_df):
+    return {
+        sym: np.random.random(
+            data_source_df[data_source_df["symbol"] == sym].shape[0]
+        )
+        for sym in symbols
+    }
+
+
+@pytest.fixture(params=[True, False])
+def trained_models(model_source, preds, symbols, data_source_df, request):
+    trained_models = {}
+    for sym in symbols:
+        model_sym = ModelSymbol(MODEL_NAME, sym)
+        if request.param:
+
+            def predict_fn(preds_array):
+                def _(model, df):
+                    return preds_array
+
+                return _
+
+            trained_models[model_sym] = TrainedModel(
+                MODEL_NAME,
+                FakeModel(sym, None),
+                predict_fn=predict_fn(preds[sym]),
+                input_cols=("hhv", "llv", "sumv"),
+            )
+        else:
+            trained_models[model_sym] = TrainedModel(
+                MODEL_NAME,
+                FakeModel(sym, preds[sym]),
+                predict_fn=None,
+                input_cols=("hhv", "llv", "sumv"),
+            )
+    return trained_models
+
+
+@pytest.fixture()
+def trained_model(trained_models):
+    return list(trained_models.values())[0]
+
+
+@pytest.fixture()
+def col_scope(data_source_df):
+    return ColumnScope(data_source_df.set_index(["symbol", "date"]))
+
+
+@pytest.fixture()
+def ind_scope(ind_data, dates):
+    return IndicatorScope(ind_data, dates)
+
+
+@pytest.fixture()
+def declared_intervals():
+    return frozenset()
+
+
+@pytest.fixture()
+def interval_scope(ind_scope):
+    return IntervalScope(IntervalData(), ind_scope)
+
+
+@pytest.fixture()
+def input_scope(col_scope, ind_scope, trained_models):
+    return ModelInputScope(col_scope, ind_scope, trained_models)
+
+
+@pytest.fixture()
+def pred_scope(trained_models, input_scope):
+    return PredictionScope(trained_models, input_scope)
+
+
+@pytest.fixture()
+def pending_orders():
+    return (
+        PendingOrder(
+            id=1,
+            type="buy",
+            symbol="SPY",
+            created=np.datetime64("2020-01-05"),
+            exec_date=np.datetime64("2020-01-10"),
+            shares=Decimal(100),
+            limit_price=None,
+            fill_price=PriceType.MIDDLE,
+            exec_bar=5,
+            timeout_bars=None,
+            stops=None,
+        ),
+        PendingOrder(
+            id=2,
+            type="sell",
+            symbol="AAPL",
+            created=np.datetime64("2020-01-06"),
+            exec_date=np.datetime64("2020-01-08"),
+            shares=Decimal(200),
+            limit_price=Decimal(99),
+            fill_price=PriceType.AVERAGE,
+            exec_bar=6,
+            timeout_bars=None,
+            stops=None,
+        ),
+    )
+
+
+@pytest.fixture()
+def pending_order_scope(pending_orders):
+    scope = PendingOrderScope()
+    for order in pending_orders:
+        scope.add(
+            type=order.type,
+            symbol=order.symbol,
+            created=order.created,
+            exec_date=order.exec_date,
+            shares=order.shares,
+            limit_price=order.limit_price,
+            fill_price=order.fill_price,
+            exec_bar=order.exec_bar,
+            timeout_bars=order.timeout_bars,
+            stops=order.stops,
+        )
+    return scope
+
+
+@pytest.fixture()
+def setup_enabled_model_cache(scope, tmp_path):
+    enable_model_cache("test", tmp_path)
+    yield
+    clear_model_cache()
+    disable_model_cache()
+
+
+@pytest.fixture(params=[True, False])
+def setup_model_cache(scope, tmp_path, request):
+    if request.param:
+        enable_model_cache("test", tmp_path)
+    else:
+        disable_model_cache()
+    yield
+    if request.param:
+        clear_model_cache()
+    disable_model_cache()
+
+
+@pytest.fixture()
+def setup_enabled_ds_cache(scope, tmp_path):
+    enable_data_source_cache("test", tmp_path)
+    yield
+    clear_data_source_cache()
+    disable_data_source_cache()
+
+
+@pytest.fixture(params=[True, False])
+def setup_ds_cache(scope, tmp_path, request):
+    if request.param:
+        enable_data_source_cache("test", tmp_path)
+    else:
+        disable_data_source_cache()
+    yield
+    if request.param:
+        clear_data_source_cache()
+    disable_data_source_cache()
+
+
+@pytest.fixture()
+def setup_enabled_ind_cache(scope, tmp_path):
+    enable_indicator_cache("test", tmp_path)
+    yield
+    clear_indicator_cache()
+    disable_indicator_cache()
+
+
+@pytest.fixture(params=[True, False])
+def setup_ind_cache(scope, tmp_path, request):
+    if request.param:
+        enable_indicator_cache("test", tmp_path)
+    else:
+        disable_indicator_cache()
+    yield
+    if request.param:
+        clear_indicator_cache()
+    disable_indicator_cache()

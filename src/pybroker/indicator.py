@@ -1,0 +1,1576 @@
+"""Contains indicator related functionality."""
+
+"""Copyright (C) 2023 Edward West. All rights reserved.
+
+This code is licensed under Apache 2.0 with Commons Clause license
+(see LICENSE for details).
+"""
+
+import itertools
+import numpy as np
+import pandas as pd
+import pybroker.vect as vect
+from pybroker.cache import CacheDateFields, IndicatorCacheKey
+from pybroker.common import BarData, DataCol, IndicatorSymbol
+from pybroker.optimize import (
+    _find_hyperparam_names,
+    _hyperparam_specs_from_kwargs,
+    _resolve_hyperparams,
+    build_run_hyperparams,
+)
+from pybroker.parallel import parallel
+from pybroker.eval import iqr, relative_entropy
+from pybroker.scope import (
+    StaticScope,
+    SymbolArrayStore,
+    run_with_scope,
+    sym_data_from_store,
+    symbol_array_store_from_frame,
+)
+from pybroker.interval import (
+    IntervalData,
+    CompressedBars,
+    TimeframeInterval,
+    compressed_bars_to_bar_data,
+    normalize_intervals,
+    parse_indicator_interval_name,
+    validate_source_name,
+)
+from pybroker.vect import highv, lowv, returnv
+from collections import defaultdict
+from joblib import delayed
+from numpy.typing import NDArray
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Union,
+)
+
+
+def _to_bar_data(df: pd.DataFrame) -> BarData:
+    required_cols = (
+        DataCol.DATE,
+        DataCol.OPEN,
+        DataCol.HIGH,
+        DataCol.LOW,
+        DataCol.CLOSE,
+    )
+    if not all(col.value in df.columns for col in required_cols):
+        df = df.reset_index()
+    for col in required_cols:
+        if col.value not in df.columns:
+            raise ValueError(
+                f"DataFrame is missing required column: {col.value}"
+            )
+    return BarData(
+        **{
+            col.value: df[col.value].to_numpy(copy=False)
+            for col in required_cols
+        },
+        **{
+            col.value: (
+                df[col.value].to_numpy(copy=False)
+                if col.value in df.columns
+                else None
+            )
+            for col in (DataCol.VOLUME, DataCol.VWAP)
+        },  # type: ignore[arg-type]
+        **{
+            col: df[col].to_numpy(copy=False) if col in df.columns else None
+            for col in sorted(StaticScope.instance().custom_data_cols)
+        },  # type: ignore[arg-type]
+    )
+
+
+class Indicator:
+    """Class representing an indicator.
+
+    Args:
+        name: Name of indicator.
+        fn: :class:`Callable` used to compute the series of indicator values.
+        kwargs: ``dict`` of kwargs to pass to ``fn``.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        fn: Callable[..., NDArray[np.float64]],
+        kwargs: dict[str, Any],
+    ):
+        self.name = name
+        self._fn = fn
+        self._kwargs = kwargs
+        # _kwargs is fixed at construction (hyperparams resolve per call
+        # into a new dict), so the derived names are computed once.
+        self._hyperparam_names = _find_hyperparam_names(kwargs)
+
+    @property
+    def hyperparam_names(self) -> frozenset[str]:
+        return self._hyperparam_names
+
+    def relative_entropy(self, data: Union[BarData, pd.DataFrame]) -> float:
+        """Generates indicator data with ``data`` and computes its relative
+        `entropy
+        <https://en.wikipedia.org/wiki/Entropy_(information_theory)>`_.
+        """
+        return relative_entropy(self(data).values)
+
+    def iqr(self, data: Union[BarData, pd.DataFrame]) -> float:
+        """Generates indicator data with ``data`` and computes its
+        `interquartile range (IQR)
+        <https://en.wikipedia.org/wiki/Interquartile_range>`_.
+        """
+        return iqr(self(data).values)
+
+    def intervals(
+        self, *intervals: TimeframeInterval
+    ) -> "IntervalBoundIndicator":
+        r"""Binds this indicator to one or more compression intervals for use
+        with :meth:`pybroker.strategy.Strategy.add_execution`.
+
+        A bound indicator is computed on exactly the listed intervals, where
+        its values are read with
+        :meth:`pybroker.context.IntervalContext.indicator`. Binding replaces
+        the default base-timeframe computation; include the literal
+        ``'base'`` in ``intervals`` to also compute the indicator on the
+        base timeframe. Bound intervals are automatically made available
+        through :meth:`pybroker.context.ExecContext.interval` without also
+        declaring them in the ``intervals`` parameter of
+        :meth:`~pybroker.strategy.Strategy.add_execution`::
+
+            sma_10 = pybroker.indicator("sma_10", sma_fn)
+            strategy.add_execution(
+                fn, "SPY", indicators=sma_10.intervals("base", "weekly")
+            )
+
+        Args:
+            intervals: One or more
+                :class:`~pybroker.interval.TimeframeInterval`\ s to compute
+                this indicator on, each strictly coarser than the base bar
+                spacing of the backtest data, or the literal ``'base'`` for
+                the base timeframe.
+
+        Returns:
+            :class:`.IntervalBoundIndicator` binding this indicator to
+            ``intervals``.
+        """
+        if not intervals:
+            raise ValueError(
+                "Indicator.intervals() requires at least one interval."
+            )
+        return IntervalBoundIndicator(
+            indicator=self,
+            intervals=normalize_intervals(
+                intervals, "intervals", allow_base=True
+            ),
+        )
+
+    def __call__(
+        self,
+        data: Union[BarData, pd.DataFrame],
+        hyperparams: Optional[dict[str, Any]] = None,
+    ) -> pd.Series:
+        """Computes indicator values."""
+        if isinstance(data, pd.DataFrame):
+            data = _to_bar_data(data)
+        if self.hyperparam_names:
+            effective = (
+                hyperparams
+                if hyperparams is not None
+                else build_run_hyperparams(
+                    _hyperparam_specs_from_kwargs(self._kwargs)
+                )
+            )
+            resolved = _resolve_hyperparams(self._kwargs, effective)
+            values = self._fn(data, **resolved)
+        elif self._kwargs:
+            values = self._fn(data, **self._kwargs)
+        else:
+            values = self._fn(data)
+        if isinstance(values, pd.Series):
+            values = values.to_numpy()
+        if len(values.shape) != 1:
+            raise ValueError(
+                f"Indicator {self.name} must return a one-dimensional array."
+            )
+        return pd.Series(values, index=data.date)
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __str__(self):
+        return f"Indicator({self.name!r}, {self._kwargs})"
+
+
+class IntervalBoundIndicator(NamedTuple):
+    """An :class:`.Indicator` bound to one or more compression intervals,
+    returned by :meth:`Indicator.intervals` and passed to the ``indicators``
+    parameter of :meth:`pybroker.strategy.Strategy.add_execution`.
+    """
+
+    indicator: Indicator
+    """The bound :class:`.Indicator`."""
+
+    intervals: frozenset[TimeframeInterval]
+    r"""Normalized :class:`~pybroker.interval.TimeframeInterval`\ s the
+    indicator is computed on. May include the literal ``'base'`` for the
+    base timeframe.
+    """
+
+
+def _compressed_to_bar_data(bars):
+    if not isinstance(bars, CompressedBars):
+        raise TypeError(f"Expected CompressedBars, received {type(bars)!r}.")
+    return compressed_bars_to_bar_data(bars)
+
+
+def _indicator_args(
+    ind_name: str,
+    sym: str,
+    sym_cols: Mapping[str, Optional[NDArray]],
+    sym_interval_data: Optional[IntervalData],
+    custom_data_cols: Iterable[str],
+    default_data_cols: frozenset[str],
+) -> dict[str, Any]:
+    _, token = parse_indicator_interval_name(ind_name)
+    if token is not None:
+        if sym_interval_data is None or (sym, token) not in (
+            sym_interval_data.compressed
+        ):
+            raise ValueError(
+                f"Timeframe indicator {ind_name!r} requires compressed data "
+                f"for {sym!r} on interval {token!r}. Bind the indicator with "
+                "Indicator.intervals() (or its model with "
+                "ModelSource.intervals()) on the execution that owns "
+                f"{sym!r}."
+            )
+        key = (sym, token)
+        bars = sym_interval_data.compressed[key].bars
+        return {
+            "symbol": sym,
+            "ind_name": ind_name,
+            "date": bars.dates,
+            "open": bars.open,
+            "high": bars.high,
+            "low": bars.low,
+            "close": bars.close,
+            "volume": bars.volume,
+            "vwap": bars.vwap,
+            "custom_col_data": bars.custom,
+        }
+    return {
+        "symbol": sym,
+        "ind_name": ind_name,
+        "custom_col_data": {col: sym_cols[col] for col in custom_data_cols},
+        **{col: sym_cols[col] for col in default_data_cols},
+    }
+
+
+def _interval_data_by_symbol(
+    interval_data: Optional[IntervalData],
+) -> dict[str, IntervalData]:
+    """Groups ``interval_data`` by symbol so workers only receive their own
+    compressed data. ``CompressedSymbolData`` values are shared by reference.
+    """
+    if interval_data is None:
+        return {}
+    grouped: dict[str, dict] = defaultdict(dict)
+    for key, data in interval_data.compressed.items():
+        grouped[key[0]][key] = data
+    return {
+        sym: IntervalData(compressed=compressed)
+        for sym, compressed in grouped.items()
+    }
+
+
+def _run_indicators_for_symbol(
+    sym: str,
+    ind_names: tuple[str, ...],
+    sym_cols: Mapping[str, Optional[NDArray]],
+    sym_interval_data: Optional[IntervalData],
+    fns: Mapping[str, Callable[..., tuple[IndicatorSymbol, pd.Series]]],
+    custom_data_cols: tuple[str, ...],
+    default_data_cols: frozenset[str],
+) -> tuple[tuple[IndicatorSymbol, pd.Series], ...]:
+    return tuple(
+        fns[ind_name](
+            **_indicator_args(
+                ind_name,
+                sym,
+                sym_cols,
+                sym_interval_data,
+                custom_data_cols,
+                default_data_cols,
+            )
+        )
+        for ind_name in ind_names
+    )
+
+
+def _decorate_indicator_fn(
+    ind_name: str, hyperparams: Optional[dict[str, Any]] = None
+):
+    base_name, _ = parse_indicator_interval_name(ind_name)
+    fn = StaticScope.instance().get_indicator(base_name).__call__
+
+    def decorated_indicator_fn(
+        symbol: str,
+        ind_name: str,
+        date: NDArray[np.datetime64],
+        open: NDArray[np.float64],
+        high: NDArray[np.float64],
+        low: NDArray[np.float64],
+        close: NDArray[np.float64],
+        volume: Optional[NDArray[np.float64]],
+        vwap: Optional[NDArray[np.float64]],
+        custom_col_data: Mapping[str, Optional[NDArray]],
+    ) -> tuple[IndicatorSymbol, pd.Series]:
+        bar_data = BarData(
+            date=date,
+            open=open,
+            high=high,
+            low=low,
+            close=close,
+            volume=volume,
+            vwap=vwap,
+            **custom_col_data,
+        )
+        series = fn(bar_data, hyperparams=hyperparams)
+        return IndicatorSymbol(ind_name, symbol), series
+
+    return decorated_indicator_fn
+
+
+def indicator(
+    name: str, fn: Callable[..., NDArray[np.float64]], **kwargs
+) -> Indicator:
+    r"""Creates an :class:`.Indicator` instance and registers it globally with
+    ``name``.
+
+    Args:
+        name: Name for referencing the indicator globally.
+        fn: ``Callable[[BarData, ...], NDArray[float]]`` used to compute the
+            series of indicator values.
+        \**kwargs: Additional arguments to pass to ``fn``.
+
+    Returns:
+        :class:`.Indicator` instance.
+    """
+    validate_source_name(name, "indicator")
+    scope = StaticScope.instance()
+    ind = Indicator(name, fn, kwargs)
+    scope.set_indicator(ind)
+    return ind
+
+
+class IndicatorsMixin:
+    """Mixin implementing indicator related functionality."""
+
+    def _indicator_memo_store(
+        self,
+    ) -> dict[tuple[str, str, tuple[tuple[str, Any], ...]], pd.Series]:
+        store = getattr(self, "_indicator_memo", None)
+        if store is None:
+            store = {}
+            self._indicator_memo = store
+        return store
+
+    def _memo_key(
+        self,
+        ind_name: str,
+        symbol: str,
+        hyperparams: Optional[dict[str, Any]],
+    ) -> Optional[tuple[str, str, tuple[tuple[str, Any], ...]]]:
+        base_name, _ = parse_indicator_interval_name(ind_name)
+        ind = StaticScope.instance().get_indicator(base_name)
+        if not ind.hyperparam_names:
+            return None
+        if hyperparams is None:
+            subset = build_run_hyperparams(
+                _hyperparam_specs_from_kwargs(ind._kwargs)
+            )
+        else:
+            subset = {n: hyperparams[n] for n in ind.hyperparam_names}
+        return (
+            ind_name,
+            symbol,
+            tuple(sorted(subset.items())),
+        )
+
+    def _get_memoized_indicator(
+        self,
+        ind_sym: IndicatorSymbol,
+        hyperparams: Optional[dict[str, Any]],
+    ) -> Optional[pd.Series]:
+        if getattr(self, "_indicator_memo_max", 0) == 0:
+            return None
+        key = self._memo_key(ind_sym.ind_name, ind_sym.symbol, hyperparams)
+        if key is None:
+            return None
+        return self._indicator_memo_store().get(key)
+
+    def _set_memoized_indicator(
+        self,
+        ind_sym: IndicatorSymbol,
+        series: pd.Series,
+        hyperparams: Optional[dict[str, Any]],
+    ) -> None:
+        memo_max = getattr(self, "_indicator_memo_max", 0)
+        if memo_max == 0:
+            return
+        key = self._memo_key(ind_sym.ind_name, ind_sym.symbol, hyperparams)
+        if key is None:
+            return
+        memo = self._indicator_memo_store()
+        if len(memo) >= memo_max:
+            oldest = next(iter(memo))
+            del memo[oldest]
+            StaticScope.instance().logger.debug_compute_indicators(
+                is_parallel=False
+            )
+        memo[key] = series
+
+    def compute_indicators(
+        self,
+        df: pd.DataFrame,
+        indicator_syms: Iterable[IndicatorSymbol],
+        cache_date_fields: Optional[CacheDateFields],
+        parallel_indicators: bool,
+        interval_data: Optional[IntervalData] = None,
+        symbol_store: Optional[SymbolArrayStore] = None,
+        hyperparams: Optional[dict[str, Any]] = None,
+    ) -> dict[IndicatorSymbol, pd.Series]:
+        """Computes indicator data for the provided
+        :class:`pybroker.common.IndicatorSymbol` pairs.
+
+        Args:
+            df: :class:`pandas.DataFrame` used to compute the indicator values.
+            indicator_syms: ``Iterable`` of
+                :class:`pybroker.common.IndicatorSymbol` pairs of indicators
+                to compute.
+            cache_date_fields: Date fields used to key cache data. Pass
+                ``None`` to disable caching.
+            parallel_indicators: If ``True``, indicator data is
+                computed in parallel using multiple processes. If ``False``,
+                indicator data is computed serially for all
+                :class:`pybroker.common.IndicatorSymbol` pairs.
+            interval_data: Optional compressed interval data.
+            symbol_store: Optional pre-built :class:`pybroker.scope.SymbolArrayStore` to
+                avoid rebuilding per-symbol arrays from ``df``.
+            hyperparams: Optional hyperparameter overrides for indicators
+                that declare hyperparameters. During
+                :meth:`pybroker.optimize.OptimizeMixin.optimize`, results are
+                memoized in memory.
+
+        Returns:
+            ``dict`` mapping each :class:`pybroker.common.IndicatorSymbol` pair
+            to a computed :class:`pandas.Series` of indicator values.
+        """
+        if not indicator_syms or df.empty:
+            return {}
+        scope = StaticScope.instance()
+        indicator_data, uncached_ind_syms = self._get_cached_indicators(
+            indicator_syms, cache_date_fields, hyperparams
+        )
+        memo_hits: list[IndicatorSymbol] = []
+        still_uncached: list[IndicatorSymbol] = []
+        for ind_sym in uncached_ind_syms:
+            memo_series = self._get_memoized_indicator(ind_sym, hyperparams)
+            if memo_series is not None:
+                indicator_data[ind_sym] = memo_series
+                memo_hits.append(ind_sym)
+            else:
+                still_uncached.append(ind_sym)
+        uncached_ind_syms = still_uncached
+        if not uncached_ind_syms:
+            scope.logger.loaded_indicator_data()
+            scope.logger.info_loaded_indicator_data(indicator_syms)
+            return indicator_data
+        if indicator_data:
+            scope.logger.info_loaded_indicator_data(indicator_data.keys())
+        scope.logger.indicator_data_start(uncached_ind_syms)
+        scope.logger.info_indicator_data_start(uncached_ind_syms)
+        needed_syms = frozenset(sym for _, sym in uncached_ind_syms)
+        if symbol_store is None:
+            symbol_store = symbol_array_store_from_frame(
+                df, symbols=needed_syms
+            )
+        sym_data = sym_data_from_store(symbol_store, scope.ordered_data_cols)
+        for i, (ind_sym, series) in enumerate(
+            self._run_indicators(
+                sym_data,
+                uncached_ind_syms,
+                parallel_indicators,
+                interval_data,
+                hyperparams,
+            )
+        ):
+            indicator_data[ind_sym] = series
+            self._set_memoized_indicator(ind_sym, series, hyperparams)
+            self._set_cached_indicator(
+                series, ind_sym, cache_date_fields, hyperparams
+            )
+            scope.logger.indicator_data_loading(i + 1)
+        return indicator_data
+
+    def _get_cached_indicators(
+        self,
+        indicator_syms: Iterable[IndicatorSymbol],
+        cache_date_fields: Optional[CacheDateFields],
+        hyperparams: Optional[dict[str, Any]] = None,
+    ) -> tuple[dict[IndicatorSymbol, pd.Series], list[IndicatorSymbol]]:
+        indicator_syms = sorted(indicator_syms)
+        indicator_data: dict[IndicatorSymbol, pd.Series] = {}
+        if cache_date_fields is None:
+            return indicator_data, list(indicator_syms)
+        scope = StaticScope.instance()
+        if scope.indicator_cache is None:
+            return indicator_data, list(indicator_syms)
+        uncached_ind_syms = []
+        for ind_sym in indicator_syms:
+            base_name, _ = parse_indicator_interval_name(ind_sym.ind_name)
+            if scope.get_indicator(base_name).hyperparam_names:
+                uncached_ind_syms.append(ind_sym)
+                continue
+            cache_key = IndicatorCacheKey.from_date_fields(
+                symbol=ind_sym.symbol,
+                ind_name=ind_sym.ind_name,
+                fields=cache_date_fields,
+            )
+            scope.logger.debug_get_indicator_cache(cache_key)
+            data = scope.indicator_cache.get(cache_key)
+            if data is not None:
+                indicator_data[ind_sym] = data
+            else:
+                uncached_ind_syms.append(ind_sym)
+        return indicator_data, uncached_ind_syms
+
+    def _set_cached_indicator(
+        self,
+        series: pd.Series,
+        ind_sym: IndicatorSymbol,
+        cache_date_fields: Optional[CacheDateFields],
+        hyperparams: Optional[dict[str, Any]] = None,
+    ):
+        if cache_date_fields is None:
+            return
+        scope = StaticScope.instance()
+        if scope.indicator_cache is None:
+            return
+        base_name, _ = parse_indicator_interval_name(ind_sym.ind_name)
+        if scope.get_indicator(base_name).hyperparam_names:
+            return
+        cache_key = IndicatorCacheKey.from_date_fields(
+            symbol=ind_sym.symbol,
+            ind_name=ind_sym.ind_name,
+            fields=cache_date_fields,
+        )
+        scope.logger.debug_set_indicator_cache(cache_key)
+        scope.indicator_cache.set(cache_key, series)
+
+    def _run_indicators(
+        self,
+        sym_data: Mapping[str, Mapping[str, Optional[NDArray]]],
+        ind_syms: Collection[IndicatorSymbol],
+        parallel_indicators: bool,
+        interval_data: Optional[IntervalData] = None,
+        hyperparams: Optional[dict[str, Any]] = None,
+    ) -> Iterable[tuple[IndicatorSymbol, pd.Series]]:
+        fns: dict[str, Callable[..., tuple[IndicatorSymbol, pd.Series]]] = {}
+        for ind_name, _ in ind_syms:
+            if ind_name in fns:
+                continue
+            fns[ind_name] = _decorate_indicator_fn(ind_name, hyperparams)
+        scope = StaticScope.instance()
+        custom_data_cols = tuple(sorted(scope.custom_data_cols))
+        default_data_cols = scope.default_data_cols
+        ind_names_by_sym: dict[str, list[str]] = defaultdict(list)
+        for ind_name, sym in ind_syms:
+            ind_names_by_sym[sym].append(ind_name)
+        symbols_with_work = tuple(ind_names_by_sym.keys())
+        tf_by_sym = _interval_data_by_symbol(interval_data)
+
+        def args_for(sym: str) -> tuple:
+            ind_names = tuple(ind_names_by_sym[sym])
+            return (
+                sym,
+                ind_names,
+                sym_data[sym],
+                tf_by_sym.get(sym),
+                {ind_name: fns[ind_name] for ind_name in ind_names},
+                custom_data_cols,
+                default_data_cols,
+            )
+
+        if not parallel_indicators or len(symbols_with_work) == 1:
+            scope.logger.debug_compute_indicators(is_parallel=False)
+            return tuple(
+                result
+                for sym in symbols_with_work
+                for result in _run_indicators_for_symbol(*args_for(sym))
+            )
+        scope.logger.debug_compute_indicators(is_parallel=True)
+        with parallel() as pool:
+            # Ship the caller's StaticScope, as the model trainers do. A
+            # worker process starts with an empty one, so an indicator calling
+            # pybroker.param() would read None there and silently compute
+            # different values than the same run does sequentially.
+            batches = pool(
+                delayed(run_with_scope)(
+                    scope, _run_indicators_for_symbol, *args_for(sym)
+                )
+                for sym in symbols_with_work
+            )
+        return tuple(result for batch in batches for result in batch)
+
+
+class IndicatorSet(IndicatorsMixin):
+    """Computes data for multiple indicators."""
+
+    def __init__(self):
+        self._ind_names: set[str] = set()
+
+    @staticmethod
+    def _names(
+        indicators: Union[Indicator, Iterable[Indicator]],
+        args: tuple[Indicator, ...],
+    ) -> tuple[str, ...]:
+        # A binding NamedTuple is iterable, so treat any scalar NamedTuple
+        # as a single entry to reject it by its own type name.
+        entries = (
+            (indicators, *args)
+            if isinstance(indicators, (Indicator, IntervalBoundIndicator))
+            or (
+                isinstance(indicators, tuple)
+                and hasattr(indicators, "_fields")
+            )
+            else (*indicators, *args)
+        )
+        names: list[str] = []
+        for ind in entries:
+            if not isinstance(ind, Indicator):
+                raise ValueError(
+                    "IndicatorSet requires Indicators, got "
+                    f"{type(ind).__name__}. Interval bindings are only "
+                    "valid in add_execution()."
+                )
+            names.append(ind.name)
+        return tuple(names)
+
+    def add(self, indicators: Union[Indicator, Iterable[Indicator]], *args):
+        """Adds indicators."""
+        self._ind_names.update(self._names(indicators, args))
+
+    def remove(self, indicators: Union[Indicator, Iterable[Indicator]], *args):
+        """Removes indicators."""
+        self._ind_names.difference_update(self._names(indicators, args))
+
+    def clear(self):
+        """Removes all indicators."""
+        self._ind_names.clear()
+
+    def __call__(
+        self, df: pd.DataFrame, parallel_indicators: bool = False
+    ) -> pd.DataFrame:
+        """Computes indicator data.
+
+        Args:
+            df: :class:`pandas.DataFrame` of input data.
+            parallel_indicators: If ``True``, indicator data is
+                computed in parallel using multiple processes. If ``False``,
+                indicator data is computed serially. Defaults to ``False``.
+
+        Returns:
+            :class:`pandas.DataFrame` containing the computed indicator data.
+        """
+        if not self._ind_names:
+            raise ValueError("No indicators were added.")
+        if df.empty:
+            return pd.DataFrame(
+                columns=[DataCol.DATE.value, DataCol.SYMBOL.value]
+                + list(self._ind_names)
+            )
+        # The store normalizes its keys with astype(str), so read the symbols
+        # the same way: a categorical or numeric symbol column would otherwise
+        # produce keys that do not exist in the store.
+        syms = df[DataCol.SYMBOL.value].astype(str).unique()
+        ind_syms = tuple(
+            itertools.starmap(
+                IndicatorSymbol, itertools.product(self._ind_names, syms)
+            )
+        )
+        symbol_store = symbol_array_store_from_frame(df)
+        ind_dict = self.compute_indicators(
+            df=df,
+            indicator_syms=ind_syms,
+            cache_date_fields=None,
+            parallel_indicators=parallel_indicators,
+            symbol_store=symbol_store,
+        )
+        sym_dict: dict[str, dict[str, pd.Series]] = defaultdict(dict)
+        for ind_sym, series in ind_dict.items():
+            sym_dict[ind_sym.symbol][ind_sym.ind_name] = series
+        sym_col = DataCol.SYMBOL.value
+        date_col = DataCol.DATE.value
+        n_rows = len(df)
+        sym_out = np.empty(n_rows, dtype=object)
+        date_out = np.empty(n_rows, dtype="datetime64[ns]")
+        ind_out = {
+            ind_name: np.full(n_rows, np.nan, dtype=np.float64)
+            for ind_name in self._ind_names
+        }
+        offset = 0
+        for sym in sorted(sym_dict.keys()):
+            sym_arrays = symbol_store.sym_arrays[sym]
+            dates = sym_arrays[date_col]
+            n = len(dates)
+            sym_out[offset : offset + n] = sym
+            date_out[offset : offset + n] = dates
+            for ind_name, series in sym_dict[sym].items():
+                ind_out[ind_name][offset : offset + n] = series.to_numpy()
+            offset += n
+        return pd.DataFrame(
+            {
+                sym_col: sym_out,
+                date_col: date_out,
+                **{
+                    ind_name: ind_out[ind_name]
+                    for ind_name in sorted(self._ind_names)
+                },
+            }
+        )
+
+
+def highest(name: str, field: str, period: int) -> Indicator:
+    """Creates a rolling high :class:`.Indicator`.
+
+    Args:
+        name: Indicator name.
+        field: :class:`pybroker.common.BarData` field for computing the rolling
+            high.
+        period: Lookback period.
+
+    Returns:
+        Rolling high :class:`.Indicator`.
+    """
+
+    def _highest(data: BarData):
+        values = getattr(data, field)
+        return highv(values, period)
+
+    return indicator(name, _highest)
+
+
+def lowest(name: str, field: str, period: int) -> Indicator:
+    """Creates a rolling low :class:`.Indicator`.
+
+    Args:
+        name: Indicator name.
+        field: :class:`pybroker.common.BarData` field for computing the rolling
+            low.
+        period: Lookback period.
+
+    Returns:
+        Rolling low :class:`.Indicator`.
+    """
+
+    def _lowest(data: BarData):
+        values = getattr(data, field)
+        return lowv(values, period)
+
+    return indicator(name, _lowest)
+
+
+def returns(
+    name: str, field: str, period: int = 1, use_log: bool = False
+) -> Indicator:
+    """Creates a rolling returns :class:`.Indicator`.
+
+    Args:
+        name: Indicator name.
+        field: :class:`pybroker.common.BarData` field for computing the rolling
+            returns.
+        period: Returns period. Defaults to 1.
+        use_log: Whether to compute log returns instead of arithmetic returns.
+            Defaults to ``False``.
+
+    Returns:
+        Rolling returns :class:`.Indicator`.
+    """
+
+    def _returns(data: BarData):
+        values = getattr(data, field)
+        return returnv(values, period, use_log)
+
+    return indicator(name, _returns)
+
+
+def detrended_rsi(
+    name: str, field: str, short_length: int, long_length: int, reg_length: int
+) -> Indicator:
+    """Detrended Relative Strength Index (RSI).
+
+    Args:
+        name: Indicator name.
+        field: :class:`pybroker.common.BarData` field name.
+        short_length: Lookback for the short-term RSI.
+        long_length: Lookback for the long-term RSI.
+        reg_length: Number of bars used for linear regressions.
+
+    Returns:
+        Detrended RSI :class:`.Indicator`.
+    """
+
+    def _detrended_rsi(data: BarData):
+        values = getattr(data, field)
+        return vect.detrended_rsi(
+            values,
+            short_length=short_length,
+            long_length=long_length,
+            reg_length=reg_length,
+        )
+
+    return indicator(name, _detrended_rsi)
+
+
+def macd(
+    name: str,
+    short_length: int,
+    long_length: int,
+    smoothing: float = 0.0,
+    scale: float = 1.0,
+) -> Indicator:
+    """Moving Average Convergence Divergence.
+
+    Args:
+        name: Indicator name.
+        field: :class:`pybroker.common.BarData` field name.
+        short_length: Short-term lookback.
+        long_length: Long-term lookback.
+        smoothing: Compute MACD minus smoothed if >= 2.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``1.0``.
+
+    Returns:
+        Moving Average Convergence Divergence :class:`.Indicator`.
+    """
+
+    def _macd(data: BarData):
+        return vect.macd(
+            high=data.high,
+            low=data.low,
+            close=data.close,
+            short_length=short_length,
+            long_length=long_length,
+            smoothing=smoothing,
+            scale=scale,
+        )
+
+    return indicator(name, _macd)
+
+
+def stochastic(name: str, lookback: int, smoothing: int = 0) -> Indicator:
+    """Stochastic.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+        smoothing: Number of times the raw stochastic is smoothed, either 0,
+            1, or 2 times. Defaults to ``0``.
+
+    Returns:
+        Stochastic :class:`.Indicator`.
+    """
+
+    def _stochastic(data: BarData):
+        return vect.stochastic(
+            high=data.high,
+            low=data.low,
+            close=data.close,
+            lookback=lookback,
+            smoothing=smoothing,
+        )
+
+    return indicator(name, _stochastic)
+
+
+def stochastic_rsi(
+    name: str,
+    field: str,
+    rsi_lookback: int,
+    sto_lookback: int,
+    smoothing: float = 0.0,
+) -> Indicator:
+    """Stochastic Relative Strength Index (RSI).
+
+    Args:
+        name: Indicator name.
+        field: :class:`pybroker.common.BarData` field name.
+        rsi_lookback: Lookback length for RSI calculation.
+        sto_lookback: Lookback length for Stochastic calculation.
+        smoothing: Amount of smoothing; <= 1 for none. Defaults to ``0``.
+
+    Returns:
+        Stochastic RSI :class:`.Indicator`.
+    """
+
+    def _stochastic_rsi(data: BarData):
+        values = getattr(data, field)
+        return vect.stochastic_rsi(
+            values,
+            rsi_lookback=rsi_lookback,
+            sto_lookback=sto_lookback,
+            smoothing=smoothing,
+        )
+
+    return indicator(name, _stochastic_rsi)
+
+
+def linear_trend(
+    name: str, field: str, lookback: int, atr_length: int, scale: float = 1.0
+) -> Indicator:
+    """Linear Trend Strength.
+
+    Args:
+        name: Indicator name.
+        field: :class:`pybroker.common.BarData` field name.
+        lookback: Number of lookback bars.
+        atr_length: Lookback length used for Average True Range (ATR)
+            normalization.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``1.0``.
+
+    Returns:
+        Linear Trend Strength :class:`.Indicator`.
+    """
+
+    def _linear_trend(data: BarData):
+        values = getattr(data, field)
+        return vect.linear_trend(
+            values,
+            high=data.high,
+            low=data.low,
+            close=data.close,
+            lookback=lookback,
+            atr_length=atr_length,
+            scale=scale,
+        )
+
+    return indicator(name, _linear_trend)
+
+
+def quadratic_trend(
+    name: str, field: str, lookback: int, atr_length: int, scale: float = 1.0
+) -> Indicator:
+    """Quadratic Trend Strength.
+
+    Args:
+        name: Indicator name.
+        field: :class:`pybroker.common.BarData` field name.
+        lookback: Number of lookback bars.
+        atr_length: Lookback length used for Average True Range (ATR)
+            normalization.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``1.0``.
+
+    Returns:
+        Quadratic Trend Strength :class:`.Indicator`.
+    """
+
+    def _quadratic_trend(data: BarData):
+        values = getattr(data, field)
+        return vect.quadratic_trend(
+            values,
+            high=data.high,
+            low=data.low,
+            close=data.close,
+            lookback=lookback,
+            atr_length=atr_length,
+            scale=scale,
+        )
+
+    return indicator(name, _quadratic_trend)
+
+
+def cubic_trend(
+    name: str, field: str, lookback: int, atr_length: int, scale: float = 1.0
+) -> Indicator:
+    """Cubic Trend Strength.
+
+    Args:
+        name: Indicator name.
+        field: :class:`pybroker.common.BarData` field name.
+        lookback: Number of lookback bars.
+        atr_length: Lookback length used for Average True Range (ATR)
+            normalization.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``1.0``.
+
+    Returns:
+        Cubic Trend Strength :class:`.Indicator`.
+    """
+
+    def _cubic_trend(data: BarData):
+        values = getattr(data, field)
+        return vect.cubic_trend(
+            values,
+            high=data.high,
+            low=data.low,
+            close=data.close,
+            lookback=lookback,
+            atr_length=atr_length,
+            scale=scale,
+        )
+
+    return indicator(name, _cubic_trend)
+
+
+def atr(name: str, lookback: int) -> Indicator:
+    """Average True Range (ATR).
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+
+    Returns:
+        Average True Range :class:`.Indicator`.
+    """
+
+    def _atr(data: BarData):
+        return vect.atr(
+            high=data.high, low=data.low, close=data.close, lookback=lookback
+        )
+
+    return indicator(name, _atr)
+
+
+def adx(name: str, lookback: int) -> Indicator:
+    """Average Directional Movement Index.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+
+    Returns:
+        Average Directional Movement Index :class:`.Indicator`.
+    """
+
+    def _adx(data: BarData):
+        return vect.adx(
+            high=data.high, low=data.low, close=data.close, lookback=lookback
+        )
+
+    return indicator(name, _adx)
+
+
+def aroon_up(name: str, lookback: int) -> Indicator:
+    """Aroon Upward Trend.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+
+    Returns:
+        Aroon Upward Trend :class:`.Indicator`.
+    """
+
+    def _aroon_up(data: BarData):
+        return vect.aroon_up(high=data.high, low=data.low, lookback=lookback)
+
+    return indicator(name, _aroon_up)
+
+
+def aroon_down(name: str, lookback: int) -> Indicator:
+    """Aroon Downward Trend.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+
+    Returns:
+        Aroon Downward Trend :class:`.Indicator`.
+    """
+
+    def _aroon_down(data: BarData):
+        return vect.aroon_down(high=data.high, low=data.low, lookback=lookback)
+
+    return indicator(name, _aroon_down)
+
+
+def aroon_diff(name: str, lookback: int) -> Indicator:
+    """Aroon Upward Trend minus Aroon Downward Trend.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+
+    Returns:
+        Aroon Upward Trend minus Aroon Downward Trend :class:`.Indicator`.
+    """
+
+    def _aroon_diff(data: BarData):
+        return vect.aroon_diff(high=data.high, low=data.low, lookback=lookback)
+
+    return indicator(name, _aroon_diff)
+
+
+def close_minus_ma(
+    name: str, lookback: int, atr_length: int, scale: float = 1.0
+) -> Indicator:
+    """Close Minus Moving Average.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+        atr_length: Lookback length used for Average True Range (ATR)
+            normalization.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``1.0``.
+
+    Returns:
+        Close Minus Moving Average :class:`.Indicator`.
+    """
+
+    def _close_minus_ma(data: BarData):
+        return vect.close_minus_ma(
+            high=data.high,
+            low=data.low,
+            close=data.close,
+            lookback=lookback,
+            atr_length=atr_length,
+            scale=scale,
+        )
+
+    return indicator(name, _close_minus_ma)
+
+
+def linear_deviation(
+    name: str, field: str, lookback: int, scale: float = 0.6
+) -> Indicator:
+    """Deviation from Linear Trend.
+
+    Args:
+        name: Indicator name.
+        field: :class:`pybroker.common.BarData` field name.
+        lookback: Number of lookback bars.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``0.6``.
+
+    Returns:
+        Deviation from Linear Trend :class:`.Indicator`.
+    """
+
+    def _linear_deviation(data: BarData):
+        values = getattr(data, field)
+        return vect.linear_deviation(values, lookback=lookback, scale=scale)
+
+    return indicator(name, _linear_deviation)
+
+
+def quadratic_deviation(
+    name: str, field: str, lookback: int, scale: float = 0.6
+) -> Indicator:
+    """Deviation from Quadratic Trend.
+
+    Args:
+        name: Indicator name.
+        field: :class:`pybroker.common.BarData` field name.
+        lookback: Number of lookback bars.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``0.6``.
+
+    Returns:
+        Deviation from Quadratic Trend :class:`.Indicator`.
+    """
+
+    def _quadratic_deviation(data: BarData):
+        values = getattr(data, field)
+        return vect.quadratic_deviation(values, lookback=lookback, scale=scale)
+
+    return indicator(name, _quadratic_deviation)
+
+
+def cubic_deviation(
+    name: str, field: str, lookback: int, scale: float = 0.6
+) -> Indicator:
+    """Deviation from Cubic Trend.
+
+    Args:
+        name: Indicator name.
+        field: :class:`pybroker.common.BarData` field name.
+        lookback: Number of lookback bars.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``0.6``.
+
+    Returns:
+        Deviation from Cubic Trend :class:`.Indicator`.
+    """
+
+    def _cubic_deviation(data: BarData):
+        values = getattr(data, field)
+        return vect.cubic_deviation(values, lookback=lookback, scale=scale)
+
+    return indicator(name, _cubic_deviation)
+
+
+def price_intensity(
+    name: str, smoothing: float = 0.0, scale: float = 0.8
+) -> Indicator:
+    """Price Intensity.
+
+    Args:
+        name: Indicator name.
+        smoothing: Amount of smoothing. Defaults to ``0``.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``0.8``.
+
+    Returns:
+        Price Intensity :class:`.Indicator`.
+    """
+
+    def _price_intensity(data: BarData):
+        return vect.price_intensity(
+            open=data.open,
+            high=data.high,
+            low=data.low,
+            close=data.close,
+            smoothing=smoothing,
+            scale=scale,
+        )
+
+    return indicator(name, _price_intensity)
+
+
+def price_change_oscillator(
+    name: str, short_length: int, multiplier: int, scale: float = 4.0
+) -> Indicator:
+    """Price Change Oscillator.
+
+    Args:
+        name: Indicator name.
+        short_length: Number of short lookback bars.
+        multiplier: Multiplier used to compute number of long lookback bars =
+            ``multiplier * short_length``.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``4.0``.
+
+    Returns:
+        Price Change Oscillator :class:`.Indicator`.
+    """
+
+    def _price_change_oscillator(data: BarData):
+        return vect.price_change_oscillator(
+            high=data.high,
+            low=data.low,
+            close=data.close,
+            short_length=short_length,
+            multiplier=multiplier,
+            scale=scale,
+        )
+
+    return indicator(name, _price_change_oscillator)
+
+
+def intraday_intensity(
+    name: str, lookback: int, smoothing: float = 0.0
+) -> Indicator:
+    """Intraday Intensity.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+        smoothing: Amount of smoothing; <= 1 for none. Defaults to ``0``.
+
+    Returns:
+        Intraday Intensity :class:`.Indicator`.
+    """
+
+    def _intraday_intensity(data: BarData):
+        assert data.volume is not None
+        return vect.intraday_intensity(
+            high=data.high,
+            low=data.low,
+            close=data.close,
+            volume=data.volume,
+            lookback=lookback,
+            smoothing=smoothing,
+        )
+
+    return indicator(name, _intraday_intensity)
+
+
+def money_flow(name: str, lookback: int, smoothing: float = 0.0) -> Indicator:
+    """Chaikin's Money Flow.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+        smoothing: Amount of smoothing; <= 1 for none. Defaults to ``0``.
+
+    Returns:
+        Chaikin's Money Flow :class:`.Indicator`.
+    """
+
+    def _money_flow(data: BarData):
+        assert data.volume is not None
+        return vect.money_flow(
+            high=data.high,
+            low=data.low,
+            close=data.close,
+            volume=data.volume,
+            lookback=lookback,
+            smoothing=smoothing,
+        )
+
+    return indicator(name, _money_flow)
+
+
+def reactivity(
+    name: str, lookback: int, smoothing: float = 1.0, scale: float = 0.6
+) -> Indicator:
+    """Reactivity.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+        smoothing: Smoothing multiplier.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``0.6``.
+
+    Returns:
+        Reactivity :class:`.Indicator`.
+    """
+
+    def _reactivity(data: BarData):
+        assert data.volume is not None
+        return vect.reactivity(
+            high=data.high,
+            low=data.low,
+            close=data.close,
+            volume=data.volume,
+            lookback=lookback,
+            smoothing=smoothing,
+            scale=scale,
+        )
+
+    return indicator(name, _reactivity)
+
+
+def price_volume_fit(
+    name: str, lookback: int, scale: float = 9.0
+) -> Indicator:
+    """Price Volume Fit.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``9.0``.
+
+    Returns:
+        Price Volume Fit :class:`.Indicator`.
+    """
+
+    def _price_volume_fit(data: BarData):
+        assert data.volume is not None
+        return vect.price_volume_fit(
+            close=data.close,
+            volume=data.volume,
+            lookback=lookback,
+            scale=scale,
+        )
+
+    return indicator(name, _price_volume_fit)
+
+
+def volume_weighted_ma_ratio(
+    name: str, lookback: int, scale: float = 1.0
+) -> Indicator:
+    """Volume-Weighted Moving Average Ratio.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``1.0``.
+
+    Returns:
+        Volume-Weighted Moving Average Ratio :class:`.Indicator`.
+    """
+
+    def _volume_weighted_ma_ratio(data: BarData):
+        assert data.volume is not None
+        return vect.volume_weighted_ma_ratio(
+            close=data.close,
+            volume=data.volume,
+            lookback=lookback,
+            scale=scale,
+        )
+
+    return indicator(name, _volume_weighted_ma_ratio)
+
+
+def normalized_on_balance_volume(
+    name: str, lookback: int, scale: float = 0.6
+) -> Indicator:
+    """Normalized On-Balance Volume.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``0.6``.
+
+    Returns:
+        Normalized On-Balance Volume :class:`.Indicator`.
+    """
+
+    def _normalized_on_balance_volume(data: BarData):
+        assert data.volume is not None
+        return vect.normalized_on_balance_volume(
+            close=data.close,
+            volume=data.volume,
+            lookback=lookback,
+            scale=scale,
+        )
+
+    return indicator(name, _normalized_on_balance_volume)
+
+
+def delta_on_balance_volume(
+    name: str, lookback: int, delta_length: int = 0, scale: float = 0.6
+) -> Indicator:
+    """Delta On-Balance Volume.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+        delta_length: Lag for differencing.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``0.6``.
+
+    Returns:
+        Delta On-Balance Volume :class:`.Indicator`.
+    """
+
+    def _delta_on_balance_volume(data: BarData):
+        assert data.volume is not None
+        return vect.delta_on_balance_volume(
+            close=data.close,
+            volume=data.volume,
+            lookback=lookback,
+            delta_length=delta_length,
+            scale=scale,
+        )
+
+    return indicator(name, _delta_on_balance_volume)
+
+
+def normalized_positive_volume_index(
+    name: str, lookback: int, scale: float = 0.5
+) -> Indicator:
+    """Normalized Positive Volume Index.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``0.5``.
+
+    Returns:
+        Normalized Positive Volume Index :class:`.Indicator`.
+    """
+
+    def _normalized_positive_volume_index(data: BarData):
+        assert data.volume is not None
+        return vect.normalized_positive_volume_index(
+            close=data.close,
+            volume=data.volume,
+            lookback=lookback,
+            scale=scale,
+        )
+
+    return indicator(name, _normalized_positive_volume_index)
+
+
+def normalized_negative_volume_index(
+    name: str, lookback: int, scale: float = 0.5
+) -> Indicator:
+    """Normalized Negative Volume Index.
+
+    Args:
+        name: Indicator name.
+        lookback: Number of lookback bars.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``0.5``.
+
+    Returns:
+        Normalized Negative Volume Index :class:`.Indicator`.
+    """
+
+    def _normalized_negative_volume_index(data: BarData):
+        assert data.volume is not None
+        return vect.normalized_negative_volume_index(
+            close=data.close,
+            volume=data.volume,
+            lookback=lookback,
+            scale=scale,
+        )
+
+    return indicator(name, _normalized_negative_volume_index)
+
+
+def volume_momentum(
+    name: str, short_length: int, multiplier: int = 2, scale: float = 3.0
+) -> Indicator:
+    """Volume Momentum.
+
+    Args:
+        name: Indicator name.
+        short_length: Number of short lookback bars.
+        multiplier: Lookback multiplier. Defaults to ``2``.
+        scale: Increase > 1.0 for more compression of return values,
+            decrease < 1.0 for less. Defaults to ``3.0``.
+
+    Returns:
+        Volume Momentum :class:`.Indicator`.
+    """
+
+    def _volume_momentum(data: BarData):
+        assert data.volume is not None
+        return vect.volume_momentum(
+            volume=data.volume,
+            short_length=short_length,
+            multiplier=multiplier,
+            scale=scale,
+        )
+
+    return indicator(name, _volume_momentum)
+
+
+def laguerre_rsi(name: str, fe_length: int = 13) -> Indicator:
+    """Laguerre Relative Strength Index (RSI).
+
+    Args:
+        name: Indicator name.
+        fe_length: Fractal Energy length. Defaults to ``13``.
+
+    Returns:
+        Laguerre RSI :class:`.Indicator`.
+    """
+
+    def _laguerre_rsi(data: BarData):
+        return vect.laguerre_rsi(
+            open=data.open,
+            high=data.high,
+            low=data.low,
+            close=data.close,
+            fe_length=fe_length,
+        )
+
+    return indicator(name, _laguerre_rsi)

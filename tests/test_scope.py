@@ -1,0 +1,1315 @@
+"""Unit tests for scope.py module."""
+
+"""Copyright (C) 2023 Edward West. All rights reserved.
+
+This code is licensed under Apache 2.0 with Commons Clause license
+(see LICENSE for details).
+"""
+
+import numpy as np
+import pandas as pd
+import pybroker
+import pytest
+import re
+from .fixtures import *
+from decimal import Decimal
+from pybroker.common import PriceType
+from pybroker.indicator import IndicatorSymbol
+from pybroker.interval import (
+    CompressedSymbolData,
+    compress,
+    compress_symbol_df,
+    model_interval_name,
+)
+from pybroker.model import model
+from pybroker.scope import (
+    ModelInputScope,
+    PriceScope,
+    column_scope_from_frame,
+    enable_logging,
+    enable_progress_bar,
+    disable_logging,
+    disable_progress_bar,
+    get_signals,
+    param,
+    register_columns,
+    slice_symbol_array_store_by_dates,
+    symbol_array_store_from_frame,
+    symbol_array_store_from_flat_frame,
+    symbol_array_store_from_indexed_df,
+    sym_exec_dates_from_store,
+    unregister_columns,
+)
+from pybroker.common import DataCol
+from unittest.mock import Mock
+
+
+@pytest.fixture(params=[10, None])
+def end_index(request):
+    return request.param
+
+
+@pytest.fixture()
+def mock_logger(scope):
+    logger, scope.logger = scope.logger, Mock()
+    yield scope.logger
+    scope.logger = logger
+
+
+def test_register_columns(scope):
+    scope.custom_data_cols = set()
+    register_columns("a")
+    register_columns("b", "b", "c")
+    register_columns(["d", "e"], "c")
+    expected = {"a", "b", "c", "d", "e"}
+    assert scope.custom_data_cols == expected
+    assert scope.all_data_cols == scope.default_data_cols | expected
+
+
+def test_register_columns_when_frozen_then_error(scope):
+    scope.freeze_data_cols()
+    with pytest.raises(
+        ValueError,
+        match=re.escape("Cannot modify columns when strategy is running."),
+    ):
+        register_columns("a")
+    scope.unfreeze_data_cols()
+
+
+def test_unregister_columns(scope):
+    scope.custom_data_cols = set()
+    register_columns("a", "b", "c", "d", "e")
+    unregister_columns("a", "b")
+    unregister_columns("c")
+    unregister_columns(["c"], "d")
+    assert scope.custom_data_cols == {"e"}
+    assert scope.all_data_cols == scope.default_data_cols | {"e"}
+
+
+def test_unregister_columns_when_frozen_then_error(scope):
+    scope.freeze_data_cols()
+    with pytest.raises(
+        ValueError,
+        match=re.escape("Cannot modify columns when strategy is running."),
+    ):
+        unregister_columns("a")
+    scope.unfreeze_data_cols()
+
+
+def test_enable_logging(mock_logger):
+    enable_logging()
+    mock_logger.enable.assert_called_once()
+
+
+def test_disable_logging(mock_logger):
+    disable_logging()
+    mock_logger.disable.assert_called_once()
+
+
+def test_enable_progress_bar(mock_logger):
+    enable_progress_bar()
+    mock_logger.enable_progress_bar.assert_called_once()
+
+
+def test_disable_progress_bar(mock_logger):
+    disable_progress_bar()
+    mock_logger.disable_progress_bar.assert_called_once()
+
+
+def test_param_when_empty():
+    assert param("bar") is None
+
+
+@pytest.mark.parametrize("value", [42, None])
+def test_param_when_set_and_get(value):
+    param("foo", value)
+    assert param("foo") == value
+
+
+def test_param_when_set_to_none():
+    param("baz", 11)
+    assert param("baz") == 11
+    param("baz", None)
+    assert param("baz") is None
+
+
+class TestStaticScope:
+    def test_set_and_get_indicator(self, scope, hhv_ind):
+        scope.set_indicator(hhv_ind)
+        assert scope.has_indicator(hhv_ind.name)
+        assert scope.get_indicator(hhv_ind.name) == hhv_ind
+
+    def test_get_indicator_when_not_found_then_error(self, scope):
+        with pytest.raises(
+            ValueError, match=re.escape("Indicator 'foo' does not exist.")
+        ):
+            scope.get_indicator("foo")
+
+    def test_set_and_get_model_source(self, scope, model_source):
+        scope.set_model_source(model_source)
+        assert scope.has_model_source(model_source.name)
+        assert scope.get_model_source(model_source.name) == model_source
+
+    def test_get_model_source_when_not_found_then_error(self, scope):
+        with pytest.raises(
+            ValueError, match=re.escape("ModelSource 'foo' does not exist.")
+        ):
+            scope.get_model_source("foo")
+
+    def test_get_indicator_names(self, scope, model_source, ind_names):
+        scope.set_model_source(model_source)
+        assert set(scope.get_indicator_names(model_source.name)) == set(
+            ind_names
+        )
+
+    def test_freeze_data_cols_caches_all_data_cols(self, scope):
+        scope.custom_data_cols = set()
+        register_columns("adj_close")
+        scope.freeze_data_cols()
+        cached = scope.all_data_cols
+        scope.custom_data_cols.add("ignored")
+        assert scope.all_data_cols == cached
+        assert scope._bar_data_cols is not None
+        assert "adj_close" in scope._bar_data_cols
+        scope.unfreeze_data_cols()
+        scope.custom_data_cols.add("extra")
+        assert "extra" in scope.all_data_cols
+        assert scope._all_data_cols is None
+        scope.custom_data_cols = set()
+        unregister_columns("adj_close")
+
+
+class TestColumnScope:
+    def _assert_length(self, values, end_index, data_source_df, sym):
+        df = data_source_df[data_source_df["symbol"] == sym]
+        expected = df.shape[0] if end_index is None else end_index
+        assert len(values) == expected
+
+    def test_fetch_dict(self, col_scope, data_source_df, symbols, end_index):
+        cols = ["date", "close"]
+        result = col_scope.fetch_dict(symbols[0], cols, end_index)
+        assert set(result.keys()) == set(cols)
+        for value in result.values():
+            self._assert_length(value, end_index, data_source_df, symbols[0])
+
+    def test_fetch(self, col_scope, data_source_df, symbols, end_index):
+        values = col_scope.fetch(symbols[0], "close", end_index)
+        assert isinstance(values, np.ndarray)
+        self._assert_length(values, end_index, data_source_df, symbols[0])
+
+    def test_fetch_when_cached(self, col_scope, data_source_df, symbols):
+        col_scope.fetch(symbols[0], "close", 1)
+        values = col_scope.fetch(symbols[0], "close", 2)
+        assert isinstance(values, np.ndarray)
+        self._assert_length(values, 2, data_source_df, symbols[0])
+
+    def test_fetch_dict_when_empty_names(self, col_scope, symbols, end_index):
+        result = col_scope.fetch_dict(symbols[0], [], end_index)
+        assert not len(result)
+
+    def test_fetch_dict_when_name_not_found(
+        self, col_scope, symbols, end_index
+    ):
+        result = col_scope.fetch_dict(symbols[0], ["foo"], end_index)
+        assert result["foo"] is None
+
+    def test_fetch_when_name_not_found(self, col_scope, symbols, end_index):
+        assert col_scope.fetch(symbols[0], "foo", end_index) is None
+
+    def test_fetch_when_symbol_not_found_then_error(
+        self, col_scope, end_index
+    ):
+        with pytest.raises(
+            ValueError, match=re.escape("Symbol not found: FOO.")
+        ):
+            col_scope.fetch("FOO", "close", end_index)
+
+    def test_fetch_dict_when_symbol_not_found_then_error(
+        self, col_scope, end_index
+    ):
+        with pytest.raises(
+            ValueError, match=re.escape("Symbol not found: FOO.")
+        ):
+            col_scope.fetch_dict("FOO", ["close"], end_index)
+
+    def test_fetch_dict_when_cached(
+        self, col_scope, data_source_df, symbols, end_index
+    ):
+        cols = ["date", "close"]
+        col_scope.fetch_dict(symbols[0], cols, end_index)
+        result = col_scope.fetch_dict(symbols[0], cols, end_index)
+        assert set(result.keys()) == set(cols)
+        for value in result.values():
+            self._assert_length(value, end_index, data_source_df, symbols[0])
+
+    def test_bar_data_from_data_columns(
+        self, col_scope, data_source_df, symbols, end_index
+    ):
+        register_columns("adj_close")
+        bar_data = col_scope.bar_data_from_data_columns(symbols[0], end_index)
+        sym_df = data_source_df[data_source_df["symbol"] == symbols[0]]
+        for col in ("open", "high", "low", "close", "volume", "adj_close"):
+            assert (
+                getattr(bar_data, col) == sym_df[col].to_numpy()[:end_index]
+            ).all()
+        unregister_columns("adj_close")
+
+
+class TestIndicatorScope:
+    def test_fetch(self, ind_scope, symbol, ind_data, ind_name, end_index):
+        result = ind_scope.fetch(symbol, ind_name, end_index)
+        assert isinstance(result, np.ndarray)
+        assert np.array_equal(
+            result,
+            ind_data[IndicatorSymbol(ind_name, symbol)].values[:end_index],
+            equal_nan=True,
+        )
+
+    def test_fetch_when_cached(
+        self, ind_scope, symbol, ind_data, ind_name, end_index
+    ):
+        ind_scope.fetch(symbol, ind_name, end_index)
+        result = ind_scope.fetch(symbol, ind_name, end_index)
+        assert isinstance(result, np.ndarray)
+        assert np.array_equal(
+            result,
+            ind_data[IndicatorSymbol(ind_name, symbol)].values[:end_index],
+            equal_nan=True,
+        )
+
+    @pytest.mark.parametrize("sym, name", [("FOO", "hhv"), ("SPY", "foo")])
+    def test_fetch_when_not_found_then_error(self, ind_scope, sym, name):
+        with pytest.raises(
+            ValueError,
+            match=re.escape(f"Indicator {name!r} not found for {sym}."),
+        ):
+            ind_scope.fetch(sym, name)
+
+    def test_fetch_masks_to_filter_dates_subset(
+        self, ind_data, dates, symbol, ind_name
+    ):
+        subset = np.asarray(dates, dtype="datetime64[ns]")[::2]
+        scope = IndicatorScope(ind_data, subset)
+        result = scope.fetch(symbol, ind_name)
+        raw = ind_data[IndicatorSymbol(ind_name, symbol)]
+        ind_dates = raw.index.to_numpy(dtype="datetime64[ns]")
+        expected = raw.to_numpy()[np.isin(ind_dates, subset)]
+        assert len(result) < len(raw)
+        assert np.array_equal(result, expected, equal_nan=True)
+
+    def test_filter_dates_accepts_list_and_ndarray(
+        self, ind_data, dates, symbol, ind_name
+    ):
+        as_list = IndicatorScope(ind_data, list(dates))
+        as_array = IndicatorScope(
+            ind_data, np.asarray(dates, dtype="datetime64[ns]")
+        )
+        assert np.array_equal(
+            as_list.fetch(symbol, ind_name),
+            as_array.fetch(symbol, ind_name),
+            equal_nan=True,
+        )
+
+    def test_fetch_value(self, ind_scope, symbol, ind_data, ind_name):
+        end_index = 10
+        result = ind_scope.fetch_value(symbol, ind_name, end_index)
+        expected = ind_data[IndicatorSymbol(ind_name, symbol)].values[
+            end_index - 1
+        ]
+        assert result == float(expected)
+
+    def test_fetch_value_when_cached(
+        self, ind_scope, symbol, ind_data, ind_name
+    ):
+        end_index = 10
+        ind_scope.fetch_value(symbol, ind_name, end_index)
+        result = ind_scope.fetch_value(symbol, ind_name, end_index)
+        expected = ind_data[IndicatorSymbol(ind_name, symbol)].values[
+            end_index - 1
+        ]
+        assert result == float(expected)
+
+    def test_fetch_value_when_not_found_then_error(self, ind_scope):
+        with pytest.raises(
+            ValueError,
+            match=re.escape("Indicator 'foo' not found for SPY."),
+        ):
+            ind_scope.fetch_value("SPY", "foo", 1)
+
+    def test_fetch_value_interval_bound_raises(
+        self, ind_scope, symbol, ind_data, ind_name
+    ):
+        end_index = 10
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "Indicator 'sma@weekly' is bound to interval 'weekly' and "
+                "cannot be read from the base context. Use "
+                "ctx.interval('weekly').indicator('sma') instead."
+            ),
+        ):
+            ind_scope.fetch_value(symbol, "sma@weekly", end_index)
+        # Base-name reads are unchanged.
+        expected = ind_data[IndicatorSymbol(ind_name, symbol)].values[
+            end_index - 1
+        ]
+        assert ind_scope.fetch_value(symbol, ind_name, end_index) == float(
+            expected
+        )
+
+
+class TestModelInputScope:
+    def test_fetch(
+        self, input_scope, model_source, symbol, data_source_df, end_index
+    ):
+        df = data_source_df[data_source_df["symbol"] == symbol]
+        result = input_scope.fetch(symbol, model_source.name, end_index)
+        assert isinstance(result, pd.DataFrame)
+        assert set(result.columns) == set(model_source.indicators)
+        assert (
+            result.shape[0] == df.shape[0] if end_index is None else end_index
+        )
+
+    def test_fetch_when_input_fn(
+        self,
+        scope,
+        indicators,
+        input_scope,
+        symbol,
+        data_source_df,
+        end_index,
+        trained_model,
+    ):
+        scope.custom_data_cols = set()
+        expected_cols = {"hhv", "llv", "sumv"}
+
+        def input_fn(df):
+            assert set(df.columns) == expected_cols
+            df["foo"] = np.ones(len(df["hhv"]))
+            return df
+
+        model_source = model(
+            trained_model.name,
+            lambda *_: trained_model,
+            indicators,
+            input_data_fn=input_fn,
+        )
+        df = data_source_df[data_source_df["symbol"] == symbol]
+        result = input_scope.fetch(symbol, model_source.name, end_index)
+        assert isinstance(result, pd.DataFrame)
+        assert set(result.columns) == {"foo"} | expected_cols
+        assert (
+            result.shape[0] == df.shape[0] if end_index is None else end_index
+        )
+
+    def test_fetch_when_cached(
+        self, input_scope, model_source, symbol, data_source_df, end_index
+    ):
+        input_scope.fetch(symbol, model_source.name, end_index)
+        result = input_scope.fetch(symbol, model_source.name, end_index)
+        df = data_source_df[data_source_df["symbol"] == symbol]
+        assert isinstance(result, pd.DataFrame)
+        assert set(result.columns) == set(model_source.indicators)
+        assert (
+            result.shape[0] == df.shape[0] if end_index is None else end_index
+        )
+
+    @pytest.mark.parametrize(
+        "sym, name, expected_msg",
+        [
+            ("FOO", MODEL_NAME, "Symbol not found: FOO"),
+            ("SPY", "foo", "Model 'foo' not found."),
+        ],
+    )
+    def test_fetch_when_not_found_then_error(
+        self, input_scope, sym, name, expected_msg
+    ):
+        with pytest.raises(ValueError, match=re.escape(expected_msg)):
+            input_scope.fetch(sym, name)
+
+    def test_fetch_model_input_only_fetches_input_cols(
+        self, scope, col_scope, ind_scope, trained_models, symbol
+    ):
+        scope.custom_data_cols = set()
+        register_columns("unused_custom")
+        scope.freeze_data_cols()
+        fetch_calls: list[str] = []
+        original_fetch = col_scope.fetch
+
+        def tracking_fetch(sym, col, end_index=None):
+            fetch_calls.append(col)
+            return original_fetch(sym, col, end_index)
+
+        col_scope.fetch = tracking_fetch  # type: ignore[method-assign]
+        input_scope = ModelInputScope(col_scope, ind_scope, trained_models)
+        input_scope.fetch_model_input(symbol, MODEL_NAME)
+        fetched_cols = set(fetch_calls)
+        assert "unused_custom" not in fetched_cols
+        assert {"date", "hhv", "llv", "sumv"}.issubset(fetched_cols)
+        scope.unfreeze_data_cols()
+        unregister_columns("unused_custom")
+
+
+class TestPredictionScope:
+    def test_fetch(
+        self,
+        pred_scope,
+        preds,
+        trained_model,
+        symbol,
+        data_source_df,
+        end_index,
+    ):
+        values = pred_scope.fetch(symbol, trained_model.name, end_index)
+        assert isinstance(values, np.ndarray)
+        expected = (
+            preds[symbol] if end_index is None else preds[symbol][:end_index]
+        )
+        assert np.array_equal(values, expected, equal_nan=True)
+        df = data_source_df[data_source_df["symbol"] == symbol]
+        assert len(values) == df.shape[0] if end_index is None else end_index
+
+    def test_fetch_when_cached(
+        self,
+        pred_scope,
+        preds,
+        trained_model,
+        symbol,
+        data_source_df,
+        end_index,
+    ):
+        pred_scope.fetch(symbol, trained_model.name, end_index)
+        values = pred_scope.fetch(symbol, trained_model.name, end_index)
+        assert isinstance(values, np.ndarray)
+        expected = (
+            preds[symbol] if end_index is None else preds[symbol][:end_index]
+        )
+        assert np.array_equal(values, expected, equal_nan=True)
+        df = data_source_df[data_source_df["symbol"] == symbol]
+        assert len(values) == df.shape[0] if end_index is None else end_index
+
+    @pytest.mark.parametrize(
+        "sym, name, expected_msg",
+        [
+            ("FOO", MODEL_NAME, "Symbol not found: FOO"),
+            ("SPY", "foo", "Model 'foo' not found."),
+        ],
+    )
+    def test_fetch_when_not_found_then_error(
+        self, pred_scope, sym, name, expected_msg
+    ):
+        with pytest.raises(ValueError, match=re.escape(expected_msg)):
+            pred_scope.fetch(sym, name)
+
+    def test_fetch_when_predict_not_defined_then_error(self, input_scope):
+        model = TrainedModel(
+            name=MODEL_NAME, instance={}, predict_fn=None, input_cols=None
+        )
+        pred_scope = PredictionScope(
+            models={ModelSymbol(MODEL_NAME, "SPY"): model},
+            input_scope=input_scope,
+        )
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                f"Model instance trained for {MODEL_NAME!r} does not define a "
+                "predict function. Please pass a predict_fn to "
+                "pybroker.model()."
+            ),
+        ):
+            pred_scope.fetch("SPY", MODEL_NAME)
+
+    def test_fetch_when_input_data_empty_then_error(self, col_scope):
+        model_name = "no_input_data"
+        ind_scope = IndicatorScope({}, [])
+        pybroker.model(model_name, lambda sym, train, test: {})
+        model = TrainedModel(
+            name=model_name, instance={}, predict_fn=None, input_cols=None
+        )
+        models = {ModelSymbol(model_name, "SPY"): model}
+        input_scope = ModelInputScope(col_scope, ind_scope, models)
+        pred_scope = PredictionScope(models, input_scope)
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                f"No input data found for model {model_name!r}. Consider "
+                "passing input_data_fn to pybroker#model() if custom columns "
+                "were registered."
+            ),
+        ):
+            pred_scope.fetch("SPY", model_name)
+
+    def test_predict_length_mismatch_raises(
+        self, col_scope, ind_scope, indicators, symbol, data_source_df
+    ):
+        n_rows = data_source_df[data_source_df["symbol"] == symbol].shape[0]
+        # A predict output shorter than its input must raise instead of
+        # being cached left-aligned against the bars.
+        short_name = "short_pred_model"
+        model(short_name, lambda sym, train, test: None, indicators)
+        short_model = TrainedModel(
+            name=short_name,
+            instance=None,
+            predict_fn=lambda instance, df: np.zeros(len(df))[1:],
+            input_cols=None,
+        )
+        short_models = {ModelSymbol(short_name, symbol): short_model}
+        short_pred_scope = PredictionScope(
+            short_models, ModelInputScope(col_scope, ind_scope, short_models)
+        )
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                f"predict for model {short_name!r} returned {n_rows - 1} "
+                f"predictions for {n_rows} input rows."
+            ),
+        ):
+            short_pred_scope.fetch(symbol, short_name)
+        # A predict_proba-shaped (n_rows, n_classes) result is one prediction
+        # per row and must still pass.
+        proba_name = "proba_pred_model"
+        model(proba_name, lambda sym, train, test: None, indicators)
+        proba_model = TrainedModel(
+            name=proba_name,
+            instance=None,
+            predict_fn=lambda instance, df: np.zeros((len(df), 2)),
+            input_cols=None,
+        )
+        proba_models = {ModelSymbol(proba_name, symbol): proba_model}
+        proba_pred_scope = PredictionScope(
+            proba_models, ModelInputScope(col_scope, ind_scope, proba_models)
+        )
+        values = proba_pred_scope.fetch(symbol, proba_name)
+        assert values.shape == (n_rows, 2)
+        # A single-row (1, n_classes) predict_proba result stays row-aligned
+        # and passes the length check. Regression: np.squeeze used to
+        # collapse it to (n_classes,), which the length check would then
+        # reject, aborting 1-row windows.
+        one_row = pd.DataFrame({"feature": [1.0]})
+        single = PredictionScope._run_predict(proba_model, one_row)
+        assert single.shape == (1, 2)
+        # The IntervalScope.fetch_preds warmup==0 branch raises the same way
+        # for a model bound to a compressed interval.
+        tf_name = "tf_short_pred"
+        model(
+            tf_name,
+            lambda sym, train, test: None,
+            input_data_fn=lambda df: df,
+        )
+        tf_sym = "TFSYM"
+        tf_dates = pd.date_range("2020-01-06", periods=15, freq="B")
+        close = np.linspace(100.0, 110.0, len(tf_dates))
+        sym_df = pd.DataFrame(
+            {
+                "date": tf_dates,
+                "open": close,
+                "high": close + 1.0,
+                "low": close - 1.0,
+                "close": close,
+                "volume": np.ones(len(tf_dates)),
+            }
+        )
+        interval_data = IntervalData()
+        interval_data.compressed[(tf_sym, "weekly")] = compress_symbol_df(
+            sym_df, "weekly", frozenset(), 86400.0
+        )
+        tf_model_name = model_interval_name(tf_name, "weekly")
+        tf_model = TrainedModel(
+            name=tf_model_name,
+            instance=None,
+            predict_fn=lambda instance, df: np.zeros(len(df))[1:],
+            input_cols=None,
+        )
+        tf_scope = IntervalScope(
+            interval_data,
+            IndicatorScope({}, []),
+            models={ModelSymbol(tf_model_name, tf_sym): tf_model},
+        )
+        n_input = tf_scope.window_len(tf_sym, "weekly")
+        assert n_input > 1
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                f"predict for model {tf_name!r} returned {n_input - 1} "
+                f"predictions for {n_input} input rows."
+            ),
+        ):
+            tf_scope.fetch_preds(tf_sym, "weekly", tf_name, len(tf_dates))
+
+
+class TestIntervalScope:
+    def test_completed_index_clamps_overshoot(self, ind_scope):
+        sym = "TFSYM"
+        dates = np.asarray(
+            pd.date_range("2020-01-06", periods=15, freq="B"),
+            dtype="datetime64[ns]",
+        )
+        n = len(dates)
+        close = np.linspace(100.0, 110.0, n)
+        bars, completed = compress(
+            dates, close, close + 1.0, close - 1.0, close, np.ones(n), "weekly"
+        )
+        interval_data = IntervalData()
+        interval_data.compressed[(sym, "weekly")] = CompressedSymbolData(
+            bars=bars, completed=completed, base_dates=dates
+        )
+        tf_scope = IntervalScope(interval_data, ind_scope)
+        assert len(completed) == n
+        at_end = tf_scope.completed_index(sym, "weekly", len(completed))
+        assert at_end == int(completed[-1])
+        assert at_end >= 0
+        # Overshooting end indexes clamp to the final completed bar rather
+        # than wrapping to a negative index that would expose future data.
+        for overshoot in (len(completed) + 1, len(completed) + 100):
+            assert tf_scope.completed_index(sym, "weekly", overshoot) == at_end
+        for end_index in (0, -1, -100):
+            assert tf_scope.completed_index(sym, "weekly", end_index) == -1
+
+    def test_fetch_preds_per_bar_incremental_matches_bulk(self, scope):
+        tf_name = "tf_per_bar"
+        tf_sym = "TFSYM"
+        tf_dates = pd.date_range("2020-01-06", periods=25, freq="B")
+        n = len(tf_dates)
+        close = np.linspace(100.0, 110.0, n)
+        sym_df = pd.DataFrame(
+            {
+                "date": tf_dates,
+                "open": close,
+                "high": close + 1.0,
+                "low": close - 1.0,
+                "close": close,
+                "volume": np.ones(n),
+            }
+        )
+        interval_data = IntervalData()
+        interval_data.compressed[(tf_sym, "weekly")] = compress_symbol_df(
+            sym_df, "weekly", frozenset(), 86400.0
+        )
+        lags = 2
+        tf_model_name = model_interval_name(tf_name, "weekly")
+
+        def make_scope():
+            calls = []
+
+            def predict_fn(instance, data):
+                calls.append(len(data))
+                return float(len(data))
+
+            model(
+                tf_name,
+                lambda sym, train, test, lag_train, lag_test: None,
+                lags=lags,
+                per_bar=True,
+                predict_fn=predict_fn,
+            )
+            trained = TrainedModel(
+                name=tf_model_name,
+                instance=None,
+                predict_fn=predict_fn,
+                input_cols=("close",),
+                per_bar=True,
+                lag_columns=("close",),
+            )
+            tf_scope = IntervalScope(
+                interval_data,
+                IndicatorScope({}, []),
+                models={ModelSymbol(tf_model_name, tf_sym): trained},
+            )
+            return tf_scope, calls
+
+        inc_scope, inc_calls = make_scope()
+        prefixes = [
+            np.array(inc_scope.fetch_preds(tf_sym, "weekly", tf_name, i))
+            for i in range(1, n + 1)
+        ]
+        total = inc_scope.completed_index(tf_sym, "weekly", n) + 1
+        assert total > lags
+        final = prefixes[-1]
+        assert final.dtype == np.float64
+        assert len(final) == total
+        # The first `lags` compressed bars have undefined lag features and
+        # are served as NaN without calling predict.
+        assert np.isnan(final[:lags]).all()
+        assert list(final[lags:]) == [
+            float(i + 1) for i in range(total - lags)
+        ]
+        # Exactly one predict call per non-warmup compressed bar, in order.
+        assert inc_calls == list(range(1, total - lags + 1))
+
+        bulk_scope, bulk_calls = make_scope()
+        bulk = bulk_scope.fetch_preds(tf_sym, "weekly", tf_name, n)
+        assert np.array_equal(final, bulk, equal_nan=True)
+        assert bulk_calls == inc_calls
+        for end_index, prefix in zip(range(1, n + 1), prefixes):
+            k = bulk_scope.completed_index(tf_sym, "weekly", end_index) + 1
+            assert np.array_equal(prefix, bulk[:k], equal_nan=True)
+        # A shrinking base end_index serves a prefix without re-predicting.
+        n_calls = len(bulk_calls)
+        mid = bulk_scope.completed_index(tf_sym, "weekly", n // 2) + 1
+        assert 0 < mid < total
+        shrunk = bulk_scope.fetch_preds(tf_sym, "weekly", tf_name, n // 2)
+        assert len(bulk_calls) == n_calls
+        assert np.array_equal(shrunk, bulk[:mid], equal_nan=True)
+        # clear_cache drops the per-bar buffers along with every other
+        # cached array.
+        bulk_scope.clear_cache()
+        assert not bulk_scope._per_bar_preds
+
+
+class TestPriceScope:
+    @pytest.mark.parametrize(
+        "price, round_fill_price, expected_price",
+        [
+            (50, True, 50),
+            (111.1, True, Decimal("111.1")),
+            (np.float32(99.98), True, Decimal("99.98")),
+            (lambda _symbol, _bar_data: 60, True, 60),
+            (PriceType.OPEN, True, 200),
+            (PriceType.HIGH, True, 400),
+            (PriceType.LOW, True, 100),
+            (PriceType.CLOSE, True, 300),
+            (PriceType.MIDDLE, True, round((100 + (400 - 100) / 2.0), 2)),
+            (PriceType.MIDDLE, False, (100 + (400 - 100) / 2.0)),
+            (PriceType.AVERAGE, True, round((200 + 100 + 400 + 300) / 4.0, 2)),
+        ],
+    )
+    def test_fetch(self, price, round_fill_price, expected_price):
+        df = pd.DataFrame(
+            {
+                "date": [
+                    np.datetime64("2020-02-03"),
+                    np.datetime64("2020-02-04"),
+                    np.datetime64("2020-02-05"),
+                ],
+                "symbol": ["SPY"] * 3,
+                "open": [100, 200, 300],
+                "high": [500, 400, 500],
+                "low": [200, 100, 200],
+                "close": [250, 300, 400],
+            }
+        )
+        col_scope = ColumnScope(df.set_index(["symbol", "date"]))
+        price_scope = PriceScope(col_scope, {"SPY": 2}, round_fill_price)
+        assert price_scope.fetch("SPY", price) == expected_price
+
+    def test_fetch_bar_ohlc(self):
+        df = pd.DataFrame(
+            {
+                "date": [
+                    np.datetime64("2020-02-03"),
+                    np.datetime64("2020-02-04"),
+                    np.datetime64("2020-02-05"),
+                ],
+                "symbol": ["SPY"] * 3,
+                "open": [100, 200, 300],
+                "high": [500, 400, 500],
+                "low": [200, 100, 200],
+                "close": [250, 300, 400],
+            }
+        )
+        from pybroker.scope import ColumnScope
+
+        col_scope = ColumnScope(df.set_index(["symbol", "date"]))
+        price_scope = PriceScope(col_scope, {"SPY": 2}, True)
+        date = np.datetime64("2020-02-04")
+        close, low, high = price_scope.fetch_bar_ohlc("SPY", date)
+        assert close == 300.0
+        assert low == 100.0
+        assert high == 400.0
+
+
+class TestPendingOrderScope:
+    def test_remove(self, pending_orders, pending_order_scope):
+        assert pending_order_scope.remove(pending_orders[0].id)
+        orders = tuple(pending_order_scope.orders())
+        assert len(orders) == 1
+        assert orders[0] == pending_orders[1]
+        assert not pending_order_scope.contains(1)
+        assert pending_order_scope.contains(2)
+
+    def test_remove_all(self, pending_order_scope):
+        pending_order_scope.remove_all()
+        assert not tuple(pending_order_scope.orders())
+        assert not pending_order_scope.contains(1)
+        assert not pending_order_scope.contains(2)
+
+    def test_remove_all_when_symbol(self, pending_orders, pending_order_scope):
+        pending_order_scope.remove_all("AAPL")
+        orders = tuple(pending_order_scope.orders())
+        assert len(orders) == 1
+        assert orders[0] == pending_orders[0]
+        assert not pending_order_scope.contains(2)
+        assert pending_order_scope.contains(1)
+
+    def test_contains(self, pending_order_scope):
+        assert pending_order_scope.contains(1)
+        assert not pending_order_scope.contains(3)
+
+    def test_orders(self, pending_orders, pending_order_scope):
+        assert tuple(pending_order_scope.orders()) == pending_orders
+        assert tuple(pending_order_scope.orders("SPY")) == tuple(
+            [pending_orders[0]]
+        )
+        assert not tuple(pending_order_scope.orders("FOO"))
+
+
+def test_symbol_array_store_from_frame_matches_indexed(
+    data_source_df,
+):
+    """Flat-frame store build matches legacy MultiIndex path."""
+    sym_col = "symbol"
+    date_col = "date"
+    reference = symbol_array_store_from_indexed_df(
+        data_source_df.set_index([sym_col, date_col]).sort_index()
+    )
+    built = symbol_array_store_from_frame(data_source_df)
+    assert built.symbols == reference.symbols
+    for sym in reference.symbols:
+        ref_cols = reference.sym_arrays[sym]
+        built_cols = built.sym_arrays[sym]
+        assert set(built_cols.keys()) == set(ref_cols.keys())
+        for col in ref_cols:
+            assert np.array_equal(built_cols[col], ref_cols[col])
+
+
+def test_sym_exec_dates_from_store_is_sorted(data_source_df):
+    """Symbol order must not depend on frozenset (string hash) iteration.
+
+    This mapping's insertion order decides which symbol trades first on each
+    bar when calendars are ragged, so an unsorted walk makes a
+    capital-constrained backtest depend on PYTHONHASHSEED.
+    """
+    store = symbol_array_store_from_frame(data_source_df)
+    result = sym_exec_dates_from_store(store)
+    assert list(result) == sorted(store.symbols)
+
+
+def test_column_scope_from_frame_fetch_parity(data_source_df, symbols):
+    """column_scope_from_frame fetch matches indexed ColumnScope."""
+    from pybroker.scope import ColumnScope
+
+    flat_scope = column_scope_from_frame(data_source_df)
+    indexed_scope = ColumnScope(data_source_df.set_index(["symbol", "date"]))
+    for sym in symbols:
+        for col in ("open", "high", "low", "close", "volume"):
+            flat_vals = flat_scope.fetch(sym, col)
+            indexed_vals = indexed_scope.fetch(sym, col)
+            assert np.array_equal(flat_vals, indexed_vals)
+
+
+@pytest.mark.parametrize("protocol", [2, 3, 4, 5])
+def test_symbol_array_store_pickle_round_trip_read_only(
+    data_source_df, protocol
+):
+    """Unpickling bypasses __post_init__, so without an explicit re-freeze
+    a round-tripped store came back fully writable."""
+    import copy
+    import pickle
+
+    from pybroker.scope import SymbolArrayStore
+
+    def assert_frozen(store):
+        if store.backing is not None:
+            assert not store.backing.stack.flags.writeable
+            for arr in store.backing.other.values():
+                assert not arr.flags.writeable
+        for arrays in store.sym_arrays.values():
+            for arr in arrays.values():
+                if arr is not None:
+                    assert not arr.flags.writeable
+        sym = next(iter(store.sym_arrays))
+        with pytest.raises(ValueError, match="read-only"):
+            store.sym_arrays[sym]["close"][0] = 0.0
+
+    backed = symbol_array_store_from_frame(data_source_df)
+    assert backed.backing is not None
+    assert_frozen(pickle.loads(pickle.dumps(backed, protocol=protocol)))
+    assert_frozen(copy.deepcopy(backed))
+
+    unbacked = SymbolArrayStore(
+        frozenset({"AAPL"}),
+        {
+            "AAPL": {
+                "close": np.arange(3, dtype=np.float64),
+                "date": np.array(
+                    ["2021-01-01", "2021-01-02", "2021-01-03"],
+                    dtype="datetime64[ns]",
+                ),
+            }
+        },
+    )
+    assert unbacked.backing is None
+    assert_frozen(pickle.loads(pickle.dumps(unbacked, protocol=protocol)))
+
+
+def test_get_signals(
+    symbols,
+    scope,
+    col_scope,
+    ind_scope,
+    pred_scope,
+    data_source_df,
+    ind_data,
+    preds,
+):
+    dfs = get_signals(symbols, col_scope, ind_scope, pred_scope)
+    assert set(dfs.keys()) == set(symbols)
+    for sym in symbols:
+        for col in scope.all_data_cols:
+            if col not in data_source_df.columns:
+                continue
+            assert np.array_equal(
+                dfs[sym][col].values,
+                data_source_df[data_source_df["symbol"] == sym][col].values,
+            )
+        assert np.array_equal(
+            dfs[sym][f"{MODEL_NAME}_pred"].values, preds[sym], equal_nan=True
+        )
+    for ind_name, sym in ind_data:
+        assert np.array_equal(
+            dfs[sym][ind_name].values,
+            ind_data[IndicatorSymbol(ind_name, sym)].values,
+            equal_nan=True,
+        )
+
+
+def test_clear_params(scope):
+    scope.clear_params()
+    param("alpha", 0.1)
+    param("beta", 0.2)
+    assert scope._params == {"alpha": 0.1, "beta": 0.2}
+    scope.clear_params()
+    assert scope._params == {}
+
+
+def test_slice_symbol_array_store_by_dates(data_source_df):
+    store = symbol_array_store_from_frame(data_source_df)
+    sym = "SPY"
+    all_dates = store.sym_arrays[sym]["date"]
+    selected = all_dates[::2]
+    sliced = slice_symbol_array_store_by_dates(store, selected)
+    assert sym in sliced.symbols
+    np.testing.assert_array_equal(
+        sliced.sym_arrays[sym]["date"],
+        selected,
+    )
+    assert len(sliced.sym_arrays[sym]["close"]) == len(selected)
+
+
+def test_slice_symbol_array_store_by_dates_when_empty_selection(
+    data_source_df,
+):
+    store = symbol_array_store_from_frame(data_source_df)
+    sliced = slice_symbol_array_store_by_dates(
+        store, np.array([], dtype="datetime64[ns]")
+    )
+    assert not sliced.symbols
+
+
+def test_slice_symbol_array_store_by_dates_non_contiguous(data_source_df):
+    store = symbol_array_store_from_frame(data_source_df)
+    sym = "SPY"
+    all_dates = store.sym_arrays[sym]["date"]
+    selected = np.sort(all_dates[[0, 2, 5, 9]])
+    sliced = slice_symbol_array_store_by_dates(store, selected)
+    np.testing.assert_array_equal(sliced.sym_arrays[sym]["date"], selected)
+    assert len(sliced.sym_arrays[sym]["close"]) == len(selected)
+
+
+def test_slice_store_arrays_read_only(data_source_df):
+    store = symbol_array_store_from_frame(data_source_df)
+    sym = "SPY"
+    all_dates = store.sym_arrays[sym]["date"]
+    # Contiguous selections take the slice-copy fast path; scattered
+    # selections take the njit gather path. Both must hand back frozen
+    # arrays, the njit-allocated date column included.
+    for selected in (all_dates[2:7], np.sort(all_dates[[0, 2, 5, 9]])):
+        sliced = slice_symbol_array_store_by_dates(store, selected)
+        for arrays in sliced.sym_arrays.values():
+            for arr in arrays.values():
+                assert arr.flags.writeable is False
+        with pytest.raises(ValueError, match="read-only"):
+            sliced.sym_arrays[sym]["date"][0] = np.datetime64("2000-01-01")
+        with pytest.raises(ValueError, match="read-only"):
+            sliced.sym_arrays[sym]["close"][0] = 0.0
+
+
+def _symbol_array_store_from_flat_frame_reference(
+    df: pd.DataFrame,
+    sym_col: str = DataCol.SYMBOL.value,
+    date_col: str = DataCol.DATE.value,
+    symbols: frozenset[str] | None = None,
+):
+    """Pre-optimization flat-frame store build for regression tests."""
+    from pybroker.scope import SymbolArrayStore
+    from pybroker.interval import _find_bin_starts_ends
+
+    if df.empty:
+        return SymbolArrayStore(frozenset(), {})
+    sym_values = df[sym_col].astype(str).to_numpy()
+    date_arr = df[date_col].to_numpy(dtype="datetime64[ns]", copy=False)
+    unique_syms, sym_ids = np.unique(sym_values, return_inverse=True)
+    order = np.lexsort((date_arr, sym_ids.astype(np.int64)))
+    sorted_sym_ids = sym_ids[order].astype(np.int64)
+    starts, ends = _find_bin_starts_ends(sorted_sym_ids)
+    sym_arrays: dict[str, dict[str, np.ndarray]] = {}
+    data_cols = [col for col in df.columns if col != sym_col]
+    col_arrays = {col: df[col].to_numpy(copy=True)[order] for col in data_cols}
+    sorted_dates = date_arr[order]
+    for bin_idx in range(len(starts)):
+        sym_key = str(unique_syms[sorted_sym_ids[starts[bin_idx]]])
+        if symbols is not None and sym_key not in symbols:
+            continue
+        start = int(starts[bin_idx])
+        end = int(ends[bin_idx]) + 1
+        sym_arrays[sym_key] = {
+            col: col_arrays[col][start:end] for col in data_cols
+        }
+        if date_col not in sym_arrays[sym_key]:
+            sym_arrays[sym_key][date_col] = np.asarray(
+                sorted_dates[start:end], copy=True
+            )
+    return SymbolArrayStore(frozenset(sym_arrays.keys()), sym_arrays)
+
+
+def _synthetic_flat_ohlcv(n_symbols: int, n_days: int) -> pd.DataFrame:
+    dates = pd.date_range("2020-01-02", periods=n_days, freq="B")
+    frames: list[pd.DataFrame] = []
+    for i in range(n_symbols):
+        sym = f"SYM{i:02d}"
+        close = np.linspace(100.0 + i, 150.0 + i, n_days)
+        frames.append(
+            pd.DataFrame(
+                {
+                    DataCol.SYMBOL.value: [sym] * n_days,
+                    DataCol.DATE.value: dates,
+                    DataCol.OPEN.value: close,
+                    DataCol.HIGH.value: close + 1.0,
+                    DataCol.LOW.value: close - 1.0,
+                    DataCol.CLOSE.value: close,
+                    DataCol.VOLUME.value: np.ones(n_days) * 1_000_000,
+                }
+            )
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
+class TestSymbolArrayStoreNumba:
+    @pytest.mark.parametrize("n_symbols,n_days", [(1, 1), (4, 504), (10, 500)])
+    def test_flat_frame_matches_reference(self, n_symbols, n_days):
+        df = _synthetic_flat_ohlcv(n_symbols, n_days)
+        reference = _symbol_array_store_from_flat_frame_reference(df)
+        built = symbol_array_store_from_flat_frame(df)
+        assert built.symbols == reference.symbols
+        for sym in reference.symbols:
+            for col in reference.sym_arrays[sym]:
+                np.testing.assert_array_equal(
+                    built.sym_arrays[sym][col],
+                    reference.sym_arrays[sym][col],
+                )
+
+    def test_symbols_filter(self):
+        df = _synthetic_flat_ohlcv(4, 100)
+        built = symbol_array_store_from_flat_frame(
+            df, symbols=frozenset({"SYM00"})
+        )
+        assert built.symbols == frozenset({"SYM00"})
+        assert len(built.sym_arrays["SYM00"]["close"]) == 100
+
+    def test_empty_frame(self):
+        df = pd.DataFrame(
+            columns=[
+                DataCol.SYMBOL.value,
+                DataCol.DATE.value,
+                DataCol.CLOSE.value,
+            ]
+        )
+        built = symbol_array_store_from_flat_frame(df)
+        assert not built.symbols
+        assert built.sym_arrays == {}
+
+
+def _slice_symbol_array_store_by_dates_reference(store, selected_dates):
+    """Pre-optimization per-symbol mask slice for regression tests."""
+    from pybroker.scope import SymbolArrayStore, _dates_in_target_mask
+
+    if not store.symbols:
+        return SymbolArrayStore(frozenset(), {})
+    date_col = DataCol.DATE.value
+    target = np.asarray(selected_dates, dtype="datetime64[ns]")
+    if len(target) == 0:
+        return SymbolArrayStore(frozenset(), {})
+    sym_arrays: dict[str, dict[str, np.ndarray]] = {}
+    for sym in store.symbols:
+        sym_data = store.sym_arrays[sym]
+        dates = sym_data.get(date_col)
+        if dates is None or len(dates) == 0:
+            continue
+        mask = _dates_in_target_mask(
+            np.asarray(dates, dtype="datetime64[ns]"), target
+        )
+        if not mask.any():
+            continue
+        sym_arrays[sym] = {col: arr[mask] for col, arr in sym_data.items()}
+    return SymbolArrayStore(frozenset(sym_arrays.keys()), sym_arrays)
+
+
+def _assert_stores_equal(left, right):
+    assert left.symbols == right.symbols
+    for sym in left.symbols:
+        for col in left.sym_arrays[sym]:
+            np.testing.assert_array_equal(
+                left.sym_arrays[sym][col],
+                right.sym_arrays[sym][col],
+            )
+
+
+class TestSliceStoreNumba:
+    @pytest.mark.parametrize(
+        "n_symbols,n_days", [(1, 1), (4, 504), (10, 1260)]
+    )
+    def test_every_other_date_matches_reference(self, n_symbols, n_days):
+        df = _synthetic_flat_ohlcv(n_symbols, n_days)
+        store = symbol_array_store_from_flat_frame(df)
+        sym = "SYM00"
+        selected = store.sym_arrays[sym]["date"][::2]
+        reference = _slice_symbol_array_store_by_dates_reference(
+            store, selected
+        )
+        sliced = slice_symbol_array_store_by_dates(store, selected)
+        _assert_stores_equal(reference, sliced)
+
+    @pytest.mark.parametrize("n_symbols,n_days", [(4, 504), (10, 1260)])
+    def test_scattered_dates_matches_reference(self, n_symbols, n_days):
+        df = _synthetic_flat_ohlcv(n_symbols, n_days)
+        store = symbol_array_store_from_flat_frame(df)
+        sym = "SYM00"
+        all_dates = store.sym_arrays[sym]["date"]
+        selected = np.sort(all_dates[[0, 2, 5, 9, 50, 100, 200]])
+        reference = _slice_symbol_array_store_by_dates_reference(
+            store, selected
+        )
+        sliced = slice_symbol_array_store_by_dates(store, selected)
+        _assert_stores_equal(reference, sliced)
+
+    @pytest.mark.parametrize("window", [63, 126, 252])
+    def test_contiguous_window_blocks_match_reference(self, window):
+        n_days = 1260
+        df = _synthetic_flat_ohlcv(10, n_days)
+        store = symbol_array_store_from_flat_frame(df)
+        sym = "SYM00"
+        all_dates = store.sym_arrays[sym]["date"]
+        for start in (0, 252, 504, 756):
+            selected = all_dates[start : start + window]
+            reference = _slice_symbol_array_store_by_dates_reference(
+                store, selected
+            )
+            sliced = slice_symbol_array_store_by_dates(store, selected)
+            _assert_stores_equal(reference, sliced)
+
+    def test_unsorted_target_fallback_matches_reference(self):
+        df = _synthetic_flat_ohlcv(4, 200)
+        store = symbol_array_store_from_flat_frame(df)
+        sym = "SYM00"
+        all_dates = store.sym_arrays[sym]["date"]
+        selected = all_dates[[10, 3, 7, 1, 15]]
+        reference = _slice_symbol_array_store_by_dates_reference(
+            store, selected
+        )
+        sliced = slice_symbol_array_store_by_dates(store, selected)
+        _assert_stores_equal(reference, sliced)
+
+    def test_empty_target(self):
+        df = _synthetic_flat_ohlcv(2, 50)
+        store = symbol_array_store_from_flat_frame(df)
+        sliced = slice_symbol_array_store_by_dates(
+            store, np.array([], dtype="datetime64[ns]")
+        )
+        assert not sliced.symbols
+
+    def test_single_date_single_symbol(self):
+        df = _synthetic_flat_ohlcv(1, 30)
+        store = symbol_array_store_from_flat_frame(df)
+        selected = store.sym_arrays["SYM00"]["date"][[5]]
+        reference = _slice_symbol_array_store_by_dates_reference(
+            store, selected
+        )
+        sliced = slice_symbol_array_store_by_dates(store, selected)
+        _assert_stores_equal(reference, sliced)
+        assert len(sliced.sym_arrays["SYM00"]["close"]) == 1
+
+
+def test_resolve_lag_cols_when_loader_has_no_recorded_columns(scope):
+    """A pretrained loader has no training pass to record lag columns, so its
+    default must be resolved the way a trainer's is -- data columns only --
+    rather than from whatever load_fn happened to return."""
+    from pybroker.common import TrainedModel
+    from pybroker.model import _lag_feature_cols
+    from pybroker.scope import _resolve_lag_cols
+
+    class _Source:
+        lags = 2
+        pooled = False
+        indicators = ("myind",)
+        lag_cols = ()
+
+    class _Input(dict):
+        @property
+        def columns(self):
+            return tuple(self.keys())
+
+    model_input = _Input(
+        {
+            "date": None,
+            "open": None,
+            "high": None,
+            "low": None,
+            "close": None,
+            "volume": None,
+            "myind": None,
+        }
+    )
+    trained = TrainedModel(
+        name="pre",
+        instance=None,
+        predict_fn=None,
+        input_cols=None,
+        per_bar=False,
+        lag_columns=None,
+    )
+    expected = _lag_feature_cols(
+        model_input, pooled=False, indicators=("myind",)
+    )
+    assert (
+        _resolve_lag_cols(_Source(), trained, "pre", model_input) == expected
+    )
+    assert "myind" not in expected
+
+
+def test_resolve_lag_cols_rejects_all_indicator_input_cols(scope):
+    """An empty resolution must raise, never build a zero-width matrix.
+
+    An empty tuple is not None, so every ``if lag_cols is not None:`` consumer
+    passes it through and hands the estimator a feature matrix of width 0 --
+    a silently different shape than the model was fitted on. A loader whose
+    recorded input columns are all indicators reaches exactly this.
+    """
+    from pybroker.common import TrainedModel
+    from pybroker.scope import _resolve_lag_cols
+
+    class _Source:
+        lags = 2
+        pooled = False
+        indicators = ("myind", "otherind")
+        lag_cols = ()
+
+    trained = TrainedModel(
+        name="pre",
+        instance=None,
+        predict_fn=None,
+        input_cols=("myind", "otherind"),
+        per_bar=False,
+        lag_columns=None,
+    )
+    with pytest.raises(ValueError, match="lag_cols"):
+        _resolve_lag_cols(_Source(), trained, "pre")

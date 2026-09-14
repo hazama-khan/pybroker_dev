@@ -1,0 +1,89 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2026, Edward West
+# This file is distributed under the same license as the PyBroker package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: PyBroker \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-08-09 17:02-0700\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: zh_CN\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: ../../source/notebooks/17. Models.ipynb:9 Multi-Symbol
+#: f85d4140ecd04f3188891e02458704ce
+msgid "Multi-Symbol Models"
+msgstr "多品种模型"
+
+#: ../../source/notebooks/17. 3e807d86895542258dccebc41fcd1c62 Models.ipynb:11
+#: Multi-Symbol
+msgid ""
+"The model training used so far has trained a separate instance for every "
+"ticker symbol. Instead, a single model can be trained across symbols that"
+" behave similarly, such as stocks in a specific industry."
+msgstr "到目前为止，模型训练都是为每个股票代码单独训练一个实例。而现在，也可以在行为相似的品种（例如同一行业的股票）之间训练一个共享模型。"
+
+#: ../../source/notebooks/17. 70a0da30e271409e979779d495c7da84 Models.ipynb:13
+#: Multi-Symbol
+msgid ""
+"**PyBroker v2** supports training one model across all symbols passed to "
+"`Strategy.add_execution "
+"<https://www.pybroker.com/en/latest/reference/pybroker.strategy.html#pybroker.strategy.Strategy.add_execution>`__,"
+" as shown in this notebook."
+msgstr ""
+"**PyBroker v2** 支持在传递给 `Strategy.add_execution "
+"<https://www.pybroker.com/en/latest/reference/pybroker.strategy.html#pybroker.strategy.Strategy.add_execution>`__"
+" 的所有品种上训练同一个模型，本文档将对此进行演示。"
+
+#: ../../source/notebooks/17. 1ca6be12b00941a7be9b3bbbb2d83392 Models.ipynb:64
+#: Multi-Symbol
+msgid "Training One Model on Multiple Symbols"
+msgstr "在多个品种上训练一个模型"
+
+#: ../../source/notebooks/17. Models.ipynb:66 Multi-Symbol
+#: abe3eccabf0b4073b4f9e7d1a4f2a683
+msgid ""
+"This notebook repurposes the linear regression example from `Training a "
+"Model "
+"<https://www.pybroker.com/en/latest/notebooks/6.%20Training%20a%20Model.html>`__."
+" Below, one shared `LinearRegression <https://scikit-"
+"learn.org/stable/modules/generated/sklearn.linear_model.LinearRegression.html>`__"
+" model is trained with the `close_minus_ma "
+"<https://www.pybroker.com/en/latest/reference/pybroker.indicator.html#pybroker.indicator.close_minus_ma>`__"
+" indicator on four chip stocks:"
+msgstr ""
+"本文档复用了 `训练模型 "
+"<https://www.pybroker.com/en/latest/notebooks/6.%20Training%20a%20Model.html>`__"
+" 中的线性回归示例。下面将使用 `close_minus_ma "
+"<https://www.pybroker.com/en/latest/reference/pybroker.indicator.html#pybroker.indicator.close_minus_ma>`__"
+" 指标，在四只芯片股上训练一个共享的 `LinearRegression <https://scikit-"
+"learn.org/stable/modules/generated/sklearn.linear_model.LinearRegression.html>`__"
+" 模型："
+
+#: ../../source/notebooks/17. Models.ipynb:104 Multi-Symbol
+#: aaa959c1972f49a2b34ba6d16f00f91d
+msgid ""
+"Registering the model with ``pooled=True`` will train it only once per "
+"execution. This replaces the training function's single ``symbol`` "
+"argument with a ``symbols`` tuple and passes the combined train and test "
+"splits."
+msgstr ""
+"以 ``pooled=True`` 注册模型后，该模型在每次执行中只会训练一次。这会用一个 ``symbols`` 元组替换训练函数原本单一的 "
+"``symbol`` 参数，并传入这些品种合并后的训练集和测试集划分。"
+
+#: ../../source/notebooks/17. 6c3974c92d714dc6bb8ace8f9daa18e8 Models.ipynb:106
+#: Multi-Symbol
+msgid ""
+"During the backtest, the trained model is shared across all symbols in "
+"the execution:"
+msgstr "在回测过程中，已训练的模型会在该执行中的所有品种之间共享："
+

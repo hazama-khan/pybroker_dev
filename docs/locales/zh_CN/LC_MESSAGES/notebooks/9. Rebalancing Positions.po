@@ -1,0 +1,141 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2023, Edward West
+# This file is distributed under the same license as the PyBroker package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2023.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: PyBroker \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-08-05 15:57-0700\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: zh_CN\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: ../../source/notebooks/9. 14d1cd869b774be98e369272cfb95a63 Positions.ipynb:9
+#: Rebalancing
+msgid "Rebalancing Positions"
+msgstr "重新平衡仓位"
+
+#: ../../source/notebooks/9. Positions.ipynb:11 Rebalancing
+#: f185e24319194779aa6da2b3c8ac7053
+msgid ""
+"**PyBroker** allows you to simulate portfolio rebalancing by adjusting "
+"your asset allocation to match a desired target. This notebook also "
+"demonstrates how to rebalance using `portfolio optimization "
+"<https://en.wikipedia.org/wiki/Portfolio_optimization>`__."
+msgstr ""
+"**PyBroker** 可让你通过调整资产配置以匹配目标配置来模拟投资组合再平衡。本文档还将演示如何使用 `投资组合优化 "
+"<https://en.wikipedia.org/wiki/Portfolio_optimization>`__ 进行再平衡。"
+
+#: ../../source/notebooks/9. Positions.ipynb:61 Rebalancing
+#: d12a64b851404b9d8bc8e6a33c8d09df
+msgid "Equal Position Sizing"
+msgstr "等额仓位配置"
+
+#: ../../source/notebooks/9. 528bc147ea8a4509953d846d8f09e405
+#: Positions.ipynb:63 Rebalancing
+msgid ""
+"Suppose we want to rebalance a long-only portfolio at the beginning of "
+"every month to maintain an equal allocation for each stock."
+msgstr "假设我们希望在每个月初对一个仅做多的投资组合进行再平衡，以便为每只股票维持相等的配置。"
+
+#: ../../source/notebooks/9. Positions.ipynb:65 Rebalancing
+#: f9d8058d68b64e59b24356e6757121ee
+msgid ""
+"First, we write a helper function to detect when the current bar is the "
+"start of a new month:"
+msgstr "首先，我们编写一个辅助函数，用于检测当前 K 线是否为新月份的开始："
+
+#: ../../source/notebooks/9. Positions.ipynb:91 Rebalancing
+#: be96a12455af4dffbedb32bc48fb47b0
+msgid ""
+"Next, we write a ``rebalance`` function to set an equal target allocation"
+" for each asset at the beginning of every month:"
+msgstr "接下来，我们编写一个 ``rebalance`` 函数，在每个月初为每个资产设置相等的目标配置："
+
+#: ../../source/notebooks/9. 4ccf1a8430624b4b8e8ae41e16b816c0
+#: Positions.ipynb:116 Rebalancing
+msgid ""
+"With the ``rebalance`` function complete, we can backtest our strategy "
+"using a portfolio of five stocks. To process all stocks simultaneously on"
+" each bar of data, we use the `Strategy.set_after_exec "
+"<https://www.pybroker.com/en/latest/reference/pybroker.strategy.html#pybroker.strategy.Strategy.set_after_exec>`__"
+" method:"
+msgstr ""
+"在完成 ``rebalance`` 函数后，我们可以使用包含五只股票的投资组合对策略进行回测。为了在每个数据条上同时处理所有股票，我们使用 "
+"`Strategy.set_after_exec "
+"<https://www.pybroker.com/en/latest/reference/pybroker.strategy.html#pybroker.strategy.Strategy.set_after_exec>`__"
+" 方法："
+
+#: ../../source/notebooks/9. 670820b094d349acb1b3cd16a8769ffd
+#: Positions.ipynb:191 Rebalancing
+msgid ""
+"The ``set_after_exec`` function runs after all executions added via "
+"``add_execution``. Since we passed ``None`` to ``add_execution``, no "
+"execution logic runs prior to ``after_exec``."
+msgstr ""
+"``set_after_exec`` 函数会在通过 ``add_execution`` 添加的所有执行完成后运行。由于我们向 "
+"``add_execution`` 传入了 ``None``，因此在 ``after_exec`` 之前不会运行任何执行逻辑。"
+
+#: ../../source/notebooks/9. Positions.ipynb:538 Rebalancing
+#: a9cd49592bed4fd68c29ab7c534beac4
+msgid "Portfolio Optimization"
+msgstr "投资组合优化"
+
+#: ../../source/notebooks/9. 9b4b68fdf8124eb194e52246033af291
+#: Positions.ipynb:540 Rebalancing
+msgid ""
+"`Portfolio optimization "
+"<https://en.wikipedia.org/wiki/Portfolio_optimization>`__ guides "
+"rebalancing to meet specific objectives, such as allocating stocks to "
+"minimize risk."
+msgstr ""
+"`投资组合优化 <https://en.wikipedia.org/wiki/Portfolio_optimization>`__ "
+"可指导再平衡以实现特定目标，例如以最小化风险的方式配置股票。"
+
+#: ../../source/notebooks/9. 15983a09bdf648e69115a91ed8e26d0c
+#: Positions.ipynb:542 Rebalancing
+msgid ""
+"`Riskfolio-Lib <https://riskfolio-lib.readthedocs.io/>`__ is a popular "
+"Python library for portfolio optimization. You can install it using ``pip"
+" install riskfolio-lib``."
+msgstr ""
+"`Riskfolio-Lib <https://riskfolio-lib.readthedocs.io/>`__ 是一个用于投资组合优化的流行 "
+"Python 库。你可以使用 ``pip install riskfolio-lib`` 进行安装。"
+
+#: ../../source/notebooks/9. 5b9e32ea3e204fdc86e4047b1cdb9dec
+#: Positions.ipynb:544 Rebalancing
+msgid ""
+"The following example demonstrates how to construct a minimum risk "
+"portfolio by minimizing the `Conditional Value at Risk (CVaR) "
+"<https://www.investopedia.com/terms/c/conditional_value_at_risk.asp>`__ "
+"based on the past year of returns:"
+msgstr ""
+"以下示例演示了如何通过最小化过去一年收益的 `条件风险价值（CVaR） "
+"<https://www.investopedia.com/terms/c/conditional_value_at_risk.asp>`__ "
+"来构建一个最小风险投资组合："
+
+#: ../../source/notebooks/9. 2c9e0c6e61be48088190e883a8469aff
+#: Positions.ipynb:595 Rebalancing
+msgid ""
+"For more information and examples, see the `official Riskfolio-Lib "
+"documentation <https://riskfolio-lib.readthedocs.io/>`__. Next, we "
+"backtest the strategy:"
+msgstr ""
+"有关更多信息和示例，请参阅 `Riskfolio-Lib 官方文档 <https://riskfolio-"
+"lib.readthedocs.io/>`__。接下来，我们对策略进行回测："
+
+#: ../../source/notebooks/9. Positions.ipynb:870 Rebalancing
+#: bb4ef70d15104b52a6b99527a9a139df
+msgid ""
+"The portfolio optimization allocated the entire portfolio to ``AAPL``, "
+"``AMZN``, and ``TSLA`` during the first month of the backtest."
+msgstr "在回测的第一个月，投资组合优化将整个投资组合分配给了 ``AAPL``、``AMZN`` 和 ``TSLA``。"
+

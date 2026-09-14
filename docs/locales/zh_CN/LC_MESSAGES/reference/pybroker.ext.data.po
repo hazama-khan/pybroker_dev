@@ -1,0 +1,40 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2026, Edward West
+# This file is distributed under the same license as the PyBroker package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: PyBroker \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-08-05 15:57-0700\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: zh_CN\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: ../../source/reference/pybroker.ext.data.rst:2
+#: d295cb79a3164e32aad03aa65836cc11
+msgid "pybroker.ext.data module"
+msgstr "pybroker.ext.data 模块"
+
+#: afa0e2587bf4467da8b98fb067ca2341 of pybroker.ext.data:1
+msgid "Contains extension classes."
+msgstr "包含扩展类。"
+
+#: 736d400ae7254928803cd8e9e0bc2e91 of pybroker.ext.data.AKShare:1
+msgid "Retrieves data from `AKShare <https://akshare.akfamily.xyz/>`_."
+msgstr "从 `AKShare <https://akshare.akfamily.xyz/>`_ 获取数据。"
+
+#: a1bcfab648444017ba299b3647cd6b3d of pybroker.ext.data.YQuery:1
+msgid ""
+"Retrieves data from Yahoo Finance using `Yahooquery "
+"<https://github.com/dpguthrie/yahooquery>`_\\ ."
+msgstr "使用 `Yahooquery <https://github.com/dpguthrie/yahooquery>`_\\ 从雅虎财经获取数据。"
+
